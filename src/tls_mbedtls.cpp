@@ -1,4 +1,4 @@
-#include "tls_internal.hpp"
+#include "tls_common.hpp"
 
 #include "openssl/bio.h"
 #include "openssl/crypto.h"
@@ -944,7 +944,7 @@ void* X509_get_ext_d2i(X509* x, int nid, int* /*crit*/, int* /*idx*/) {
 }
 
 /* ===== PEM ===== */
-X509* PEM_read_bio_X509(BIO* bp, X509** x, void* /*cb*/, void* /*u*/) {
+X509* PEM_read_bio_X509(BIO* bp, X509** x, pem_password_cb* /*cb*/, void* /*u*/) {
   if (!bp) return nullptr;
 
   std::string pem;
@@ -965,7 +965,7 @@ X509* PEM_read_bio_X509(BIO* bp, X509** x, void* /*cb*/, void* /*u*/) {
   return cert;
 }
 
-EVP_PKEY* PEM_read_bio_PrivateKey(BIO* bp, EVP_PKEY** x, void* /*cb*/, void* u) {
+EVP_PKEY* PEM_read_bio_PrivateKey(BIO* bp, EVP_PKEY** x, pem_password_cb* /*cb*/, void* u) {
   if (!bp) return nullptr;
 
   std::string pem;
@@ -1021,7 +1021,7 @@ int PEM_write_bio_X509(BIO* bp, X509* x) {
 }
 
 int PEM_write_bio_PrivateKey(BIO* bp, EVP_PKEY* x, const void* /*enc*/, unsigned char* /*kstr*/,
-                             int /*klen*/, void* /*cb*/, void* /*u*/) {
+                             int /*klen*/, pem_password_cb* /*cb*/, void* /*u*/) {
   if (!bp || !x || bp->kind != BioKind::Memory || !x->has_key) return 0;
   if (!x->pem.empty()) {
     bp->data.insert(bp->data.end(), x->pem.begin(), x->pem.end());

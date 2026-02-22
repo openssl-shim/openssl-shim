@@ -1,4 +1,4 @@
-#include "tls_internal.hpp"
+#include "tls_common.hpp"
 
 #include "openssl/crypto.h"
 #include "openssl/err.h"
@@ -439,12 +439,12 @@ const char* X509_verify_cert_error_string(long n) {
   }
 }
 
-X509* PEM_read_bio_X509_AUX(BIO* bp, X509** x, void* cb, void* u) {
+X509* PEM_read_bio_X509_AUX(BIO* bp, X509** x, pem_password_cb* cb, void* u) {
   return PEM_read_bio_X509(bp, x, cb, u);
 }
 
 STACK_OF_X509_INFO* PEM_X509_INFO_read_bio(BIO* bp, STACK_OF_X509_INFO* sk,
-                                           void* /*cb*/, void* /*u*/) {
+                                           pem_password_cb* /*cb*/, void* /*u*/) {
   if (!bp) return nullptr;
   if (!sk) sk = new STACK_OF_X509_INFO();
 

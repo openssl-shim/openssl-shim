@@ -16,17 +16,17 @@ typedef int pem_password_cb(char* buf, int size, int rwflag, void* userdata);
 
 #define PEM_R_NO_START_LINE 108
 
-X509*     PEM_read_bio_X509(BIO* bp, X509** x, void* cb, void* u);
-X509*     PEM_read_bio_X509_AUX(BIO* bp, X509** x, void* cb, void* u);
-EVP_PKEY* PEM_read_bio_PrivateKey(BIO* bp, EVP_PKEY** x, void* cb, void* u);
+X509*     PEM_read_bio_X509(BIO* bp, X509** x, pem_password_cb* cb, void* u);
+X509*     PEM_read_bio_X509_AUX(BIO* bp, X509** x, pem_password_cb* cb, void* u);
+EVP_PKEY* PEM_read_bio_PrivateKey(BIO* bp, EVP_PKEY** x, pem_password_cb* cb, void* u);
 EVP_PKEY* PEM_read_bio_Parameters(BIO* bp, EVP_PKEY** x);
 
 int PEM_write_bio_X509(BIO* bp, X509* x);
 int PEM_write_bio_PrivateKey(BIO* bp, EVP_PKEY* x, const void* enc,
-                             unsigned char* kstr, int klen, void* cb, void* u);
+                             unsigned char* kstr, int klen, pem_password_cb* cb, void* u);
 
 STACK_OF_X509_INFO* PEM_X509_INFO_read_bio(BIO* bp, STACK_OF_X509_INFO* sk,
-                                            void* cb, void* u);
+                                            pem_password_cb* cb, void* u);
 
 #ifdef __cplusplus
 }

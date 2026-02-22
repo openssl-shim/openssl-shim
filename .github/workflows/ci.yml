@@ -13,54 +13,47 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Windows: native (AUTO -> SCHANNEL) + forced mbedTLS
+          # Windows: native (Schannel) + forced mbedTLS
           - name: windows-native-schannel
             os: windows-latest
-            backend: AUTO
-            fetch_mbedtls: "OFF"
+            native_backend: "ON"
 
           - name: windows-forced-mbedtls
             os: windows-latest
-            backend: MBEDTLS
-            fetch_mbedtls: "ON"
+            native_backend: "OFF"
 
-          # macOS: native (AUTO -> APPLE) + forced mbedTLS
+          # macOS: native (Apple Security) + forced mbedTLS
           - name: macos-native-apple
             os: macos-latest
-            backend: AUTO
-            fetch_mbedtls: "OFF"
+            native_backend: "ON"
 
           - name: macos-forced-mbedtls
             os: macos-latest
-            backend: MBEDTLS
-            fetch_mbedtls: "ON"
+            native_backend: "OFF"
 
-          # Linux: only mbedTLS needed (native AUTO also resolves to mbedTLS)
+          # Linux: forced mbedTLS
           - name: ubuntu-forced-mbedtls
             os: ubuntu-latest
-            backend: MBEDTLS
-            fetch_mbedtls: "ON"
+            native_backend: "OFF"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Resolve Python executable for CMake
         shell: bash
-        run: echo "PYTHON_FOR_CMAKE=$(python -c 'import sys; print(sys.executable)')" >> "$GITHUB_ENV"
+        run: echo "PYTHON_FOR_CMAKE=$(python -c 'import sys; print(sys.executable.replace("\\", "/"))')" >> "$GITHUB_ENV"
 
-      - name: Install Python deps for mbedTLS codegen
+      - name: Install Python deps for mbedTLS/cpp-httplib codegen
         run: ${{ env.PYTHON_FOR_CMAKE }} -m pip install --upgrade pip jsonschema jinja2
 
       - name: Configure
         run: >-
           cmake -S . -B build
           -DPython3_EXECUTABLE=${{ env.PYTHON_FOR_CMAKE }}
-          -DNATIVE_TLS_SHIM_BACKEND=${{ matrix.backend }}
-          -DNATIVE_TLS_SHIM_FETCH_MBEDTLS=${{ matrix.fetch_mbedtls }}
-          -DNATIVE_TLS_SHIM_BUILD_TESTS=ON
-          -DNATIVE_TLS_SHIM_BUILD_EXAMPLES=ON
-          -DNATIVE_TLS_SHIM_ENABLE_INSTALL=OFF
+          -DNATIVE_TLS_SHIM_NATIVE_BACKEND=${{ matrix.native_backend }}
           -DCMAKE_BUILD_TYPE=Debug
 
       - name: Build
@@ -77,3 +70,47 @@ jobs:
       - name: Httplib cipher suite check
         if: runner.os != 'Windows'
         run: ./build/example/httplib_example
+
+      - name: Install shim
+        shell: bash
+        run: cmake --install build --config Debug --prefix "$PWD/build/install"
+
+      - name: Relocate install tree
+        shell: bash
+        run: cmake -E copy_directory "$PWD/build/install" "$PWD/build/install-relocated"
+
+      - name: Configure cpp-httplib against installed shim
+        shell: bash
+        run: >-
+          cmake -S test/cpp-httplib -B build/consumer-httplib
+          -DPython3_EXECUTABLE=${{ env.PYTHON_FOR_CMAKE }}
+          -DCMAKE_PREFIX_PATH="$PWD/build/install-relocated"
+          -DCMAKE_FIND_PACKAGE_PREFER_CONFIG=ON
+          -DCMAKE_BUILD_TYPE=Debug
+          -DHTTPLIB_REQUIRE_OPENSSL=ON
+          -DHTTPLIB_USE_OPENSSL_IF_AVAILABLE=ON
+          -DHTTPLIB_COMPILE=ON
+          -DHTTPLIB_TEST=OFF
+          -DHTTPLIB_INSTALL=OFF
+          -DHTTPLIB_USE_ZLIB_IF_AVAILABLE=OFF
+          -DHTTPLIB_USE_BROTLI_IF_AVAILABLE=OFF
+          -DHTTPLIB_USE_ZSTD_IF_AVAILABLE=OFF
+
+      - name: Assert OpenSSL package came from relocated install
+        shell: bash
+        run: |
+          python - <<'PY'
+          import pathlib
+          cache = pathlib.Path('build/consumer-httplib/CMakeCache.txt').read_text(encoding='utf-8')
+          line = next((ln for ln in cache.splitlines() if ln.startswith('OpenSSL_DIR:PATH=')), None)
+          if not line:
+              raise SystemExit('OpenSSL_DIR not found in CMakeCache.txt')
+          actual = pathlib.Path(line.split('=', 1)[1]).resolve()
+          expected = pathlib.Path('build/install-relocated/lib/cmake/OpenSSL').resolve()
+          print(f'OpenSSL_DIR={actual}')
+          if actual != expected:
+              raise SystemExit(f'Expected OpenSSL_DIR={expected}, got {actual}')
+          PY
+
+      - name: Build cpp-httplib
+        run: cmake --build build/consumer-httplib --config Debug --parallel

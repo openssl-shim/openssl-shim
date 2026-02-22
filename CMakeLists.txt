@@ -11,22 +11,19 @@ if(NOT PROJECT_IS_TOP_LEVEL)
 endif()
 
 include(GNUInstallDirs)
-include(CMakePackageConfigHelpers)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(NATIVE_TLS_SHIM_BACKEND "AUTO" CACHE STRING "TLS backend: AUTO|MBEDTLS|SCHANNEL|APPLE")
-set_property(CACHE NATIVE_TLS_SHIM_BACKEND PROPERTY STRINGS AUTO MBEDTLS SCHANNEL APPLE)
-
-option(NATIVE_TLS_SHIM_FETCH_MBEDTLS "Fetch MbedTLS with FetchContent" ON)
+option(BUILD_SHARED_LIBS "Build using shared libraries" OFF)
+option(NATIVE_TLS_SHIM_NATIVE_BACKEND "Use platform-native backend (Schannel/Apple) when available; OFF forces MbedTLS" ON)
+option(NATIVE_TLS_SHIM_ALWAYS_FETCH_MBEDTLS "Always fetch MbedTLS with FetchContent" OFF)
 option(NATIVE_TLS_SHIM_BUILD_TESTS "Build integration tests" ${PROJECT_IS_TOP_LEVEL})
 option(NATIVE_TLS_SHIM_BUILD_EXAMPLES "Build examples" ${PROJECT_IS_TOP_LEVEL})
 option(NATIVE_TLS_SHIM_ENABLE_INSTALL "Enable install/export rules" ${PROJECT_IS_TOP_LEVEL})
 
-string(TOUPPER "${NATIVE_TLS_SHIM_BACKEND}" _backend)
-if(_backend STREQUAL "AUTO")
+if(NATIVE_TLS_SHIM_NATIVE_BACKEND)
   if(WIN32)
     set(_backend "SCHANNEL")
   elseif(APPLE)
@@ -34,23 +31,55 @@ if(_backend STREQUAL "AUTO")
   else()
     set(_backend "MBEDTLS")
   endif()
-endif()
-
-if(NOT (_backend STREQUAL "MBEDTLS" OR _backend STREQUAL "SCHANNEL" OR _backend STREQUAL "APPLE"))
-  message(FATAL_ERROR "Unsupported NATIVE_TLS_SHIM_BACKEND='${NATIVE_TLS_SHIM_BACKEND}'")
+else()
+  set(_backend "MBEDTLS")
 endif()
 
 set(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND "${_backend}")
 
-if(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "SCHANNEL")
-  message(STATUS "Schannel backend selected")
-elseif(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "APPLE")
-  message(STATUS "Apple backend selected")
+
+add_library(native_tls_shim
+  src/tls_common.cpp
+  src/tls_common.hpp
+  src/tls_shared_exports.inl
+)
+
+if(WIN32 AND BUILD_SHARED_LIBS)
+  set_target_properties(native_tls_shim PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 endif()
 
-set(_mbedtls_targets)
+add_library(native_tls_shim::native_tls_shim ALIAS native_tls_shim)
+
+target_include_directories(native_tls_shim
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+
+target_compile_definitions(native_tls_shim
+  PUBLIC
+    OPENSSL_VERSION_NUMBER=0x30000000L
+)
+
+# Windows requires ws2_32 for tls_common.cpp
+if(WIN32)
+  target_link_libraries(native_tls_shim PRIVATE ws2_32)
+endif()
+
 if(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "MBEDTLS")
-  if(NATIVE_TLS_SHIM_FETCH_MBEDTLS)
+  message(STATUS "MbedTLS backend selected")
+
+  set(_mbedtls_use_fetch ${NATIVE_TLS_SHIM_ALWAYS_FETCH_MBEDTLS})
+  if(NOT _mbedtls_use_fetch)
+    # Prefer an already-installed MbedTLS 3.x when available.
+    find_package(MbedTLS 3...<4 QUIET)
+    if(NOT (TARGET mbedtls AND TARGET mbedx509 AND TARGET mbedcrypto) AND
+       NOT (TARGET MbedTLS::mbedtls AND TARGET MbedTLS::mbedx509 AND TARGET MbedTLS::mbedcrypto))
+      set(_mbedtls_use_fetch ON)
+    endif()
+  endif()
+
+  if(_mbedtls_use_fetch)
     include(FetchContent)
     FetchContent_Declare(
       mbedtls
@@ -60,11 +89,11 @@ if(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "MBEDTLS")
     set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
     set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
     set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
+    # Ensure vendored mbedTLS exports and installs a proper CMake package.
+    set(DISABLE_PACKAGE_CONFIG_AND_INSTALL OFF CACHE BOOL "" FORCE)
     # mrexodia/mbedtls cmake-fixes-3.6 uses generated sources on Windows.
     set(GEN_FILES ON CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(mbedtls)
-  else()
-    find_package(MbedTLS REQUIRED)
   endif()
 
   if(TARGET mbedtls AND TARGET mbedx509 AND TARGET mbedcrypto)
@@ -74,60 +103,31 @@ if(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "MBEDTLS")
   else()
     message(FATAL_ERROR "Unable to resolve MbedTLS targets")
   endif()
-endif()
 
-set(_native_tls_shim_sources
-  src/tls_backend.cpp
-)
-
-if(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "MBEDTLS")
-  list(APPEND _native_tls_shim_sources src/tls_mbedtls.cpp)
-elseif(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "SCHANNEL")
-  list(APPEND _native_tls_shim_sources src/tls_schannel.cpp)
-elseif(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "APPLE")
-  list(APPEND _native_tls_shim_sources src/tls_apple.cpp)
-endif()
-
-add_library(native_tls_shim STATIC ${_native_tls_shim_sources})
-
-add_library(native_tls_shim::native_tls_shim ALIAS native_tls_shim)
-
-target_include_directories(native_tls_shim
-  PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
-    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-)
-
-if(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "MBEDTLS")
+  target_sources(native_tls_shim PRIVATE src/tls_mbedtls.cpp)
   target_link_libraries(native_tls_shim PRIVATE
     $<BUILD_INTERFACE:${_mbedtls_targets}>
     $<INSTALL_INTERFACE:MbedTLS::mbedtls;MbedTLS::mbedx509;MbedTLS::mbedcrypto>)
-endif()
+  target_compile_definitions(native_tls_shim PUBLIC NATIVE_TLS_SHIM_BACKEND_MBEDTLS)
 
-if(WIN32)
-  target_link_libraries(native_tls_shim PRIVATE ws2_32 crypt32 bcrypt)
-  if(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "SCHANNEL")
-    target_link_libraries(native_tls_shim PRIVATE secur32 ncrypt)
+elseif(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "SCHANNEL")
+  message(STATUS "Schannel backend selected")
+  target_sources(native_tls_shim PRIVATE src/tls_schannel.cpp)
+  target_compile_definitions(native_tls_shim PUBLIC NATIVE_TLS_SHIM_BACKEND_SCHANNEL)
+  if(WIN32)
+    target_link_libraries(native_tls_shim PRIVATE secur32 ncrypt crypt32 bcrypt)
   endif()
-endif()
 
-if(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "APPLE")
+elseif(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "APPLE")
+  message(STATUS "Apple backend selected")
+  target_sources(native_tls_shim PRIVATE src/tls_apple.cpp)
+  target_compile_definitions(native_tls_shim PUBLIC NATIVE_TLS_SHIM_BACKEND_APPLE)
   target_link_libraries(native_tls_shim PRIVATE
     "$<LINK_LIBRARY:FRAMEWORK,Security>"
     "$<LINK_LIBRARY:FRAMEWORK,CoreFoundation>")
-endif()
 
-target_compile_definitions(native_tls_shim
-  PUBLIC
-    OPENSSL_VERSION_NUMBER=0x30000000L
-)
-
-if(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "SCHANNEL")
-  target_compile_definitions(native_tls_shim PUBLIC NATIVE_TLS_SHIM_BACKEND_SCHANNEL)
-elseif(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "APPLE")
-  target_compile_definitions(native_tls_shim PUBLIC NATIVE_TLS_SHIM_BACKEND_APPLE)
 else()
-  target_compile_definitions(native_tls_shim PUBLIC NATIVE_TLS_SHIM_BACKEND_MBEDTLS)
+  message(FATAL_ERROR "Unsupported backend: ${NATIVE_TLS_SHIM_EFFECTIVE_BACKEND}")
 endif()
 
 add_library(openssl_ssl INTERFACE)
@@ -156,13 +156,15 @@ if(NATIVE_TLS_SHIM_BUILD_EXAMPLES)
 endif()
 
 if(NATIVE_TLS_SHIM_ENABLE_INSTALL)
+  include(CMakePackageConfigHelpers)
+
   install(TARGETS native_tls_shim openssl_ssl openssl_crypto
     EXPORT NativeTLSShimTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
-  install(DIRECTORY openssl DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+  install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
   install(EXPORT NativeTLSShimTargets
     FILE NativeTLSShimTargets.cmake
@@ -183,4 +185,5 @@ if(NATIVE_TLS_SHIM_ENABLE_INSTALL)
     ${CMAKE_CURRENT_BINARY_DIR}/OpenSSLConfig.cmake
     ${CMAKE_CURRENT_BINARY_DIR}/OpenSSLConfigVersion.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/OpenSSL)
+
 endif()

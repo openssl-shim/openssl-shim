@@ -1,6 +1,37 @@
 # native-tls-shim
 
-OpenSSL header shim for projects that expect `openssl/*` APIs (notably `cpp-httplib` and `IXWebSocket`).
+OpenSSL shim aimed at making **popular C++ HTTPS/TLS libraries** work without linking OpenSSL itself.
+
+## Project goal
+
+This project is focused on compatibility with widely-used C++ networking libraries
+that depend on OpenSSL-style APIs, with an emphasis on **out-of-the-box CMake integration**.
+
+Primary usability goals:
+- build and work immediately via `add_subdirectory(...)`
+- build and work immediately via `FetchContent`
+- install as a proper CMake package for downstream `find_package(OpenSSL)` consumers
+
+It is **not** a full OpenSSL reimplementation and does not aim for complete API/ABI
+compatibility with all OpenSSL features.
+
+## Supported libraries (current focus)
+
+- `cpp-httplib`
+- `IXWebSocket`
+- standalone `Asio` SSL usage (runtime HTTPS roundtrip coverage)
+
+## Integration model (easy by default)
+
+`native-tls-shim` supports three first-class consumption modes:
+
+1. **`add_subdirectory(...)`** in a mono-repo/superbuild
+2. **`FetchContent`** for source-based dependency management
+3. **installed package** (`OpenSSLConfig.cmake`) for normal `find_package(OpenSSL)` use
+
+In all three modes, consumers use standard OpenSSL CMake targets:
+- `OpenSSL::SSL`
+- `OpenSSL::Crypto`
 
 ## Status
 
@@ -11,28 +42,32 @@ OpenSSL header shim for projects that expect `openssl/*` APIs (notably `cpp-http
 
 ## Build
 
-`NATIVE_TLS_SHIM_BACKEND` supports `AUTO`, `MBEDTLS`, `SCHANNEL`, and `APPLE`.
-`AUTO` selects SCHANNEL on Windows, APPLE on macOS, and MBEDTLS elsewhere.
+`NATIVE_TLS_SHIM_NATIVE_BACKEND` controls backend selection.
 
-Example mbedTLS build:
+- `ON` (default): uses Schannel on Windows, Apple Security on macOS, and mbedTLS elsewhere.
+- `OFF`: forces mbedTLS on all platforms.
+
+Example native-backend build (default):
 
 ```bash
-cmake -S . -B build -DNATIVE_TLS_SHIM_BACKEND=MBEDTLS
+cmake -S . -B build -DNATIVE_TLS_SHIM_NATIVE_BACKEND=ON
 cmake --build build
 ```
 
-For Schannel backend build (no mbedTLS dependency):
+Library type follows standard CMake behavior via `BUILD_SHARED_LIBS` (default `OFF`, i.e. static).
+
+Example forced-mbedTLS build:
 
 ```bash
-cmake -S . -B build-schannel -DNATIVE_TLS_SHIM_BACKEND=SCHANNEL -DNATIVE_TLS_SHIM_FETCH_MBEDTLS=OFF
-cmake --build build-schannel
+cmake -S . -B build-mbed -DNATIVE_TLS_SHIM_NATIVE_BACKEND=OFF
+cmake --build build-mbed
 ```
 
-For Apple backend build (no mbedTLS dependency):
+When mbedTLS is active, the project first tries a system-provided MbedTLS 3.x package
+and falls back to FetchContent if not found. To always fetch vendored mbedTLS, set:
 
 ```bash
-cmake -S . -B build-apple -DNATIVE_TLS_SHIM_BACKEND=APPLE -DNATIVE_TLS_SHIM_FETCH_MBEDTLS=OFF
-cmake --build build-apple
+-DNATIVE_TLS_SHIM_ALWAYS_FETCH_MBEDTLS=ON
 ```
 
 When this project is the **top-level** CMake project, tests/examples are
@@ -58,6 +93,15 @@ The server examples use pre-generated localhost certificates from
 ixwebsocket_example [url] [ca_file] [message]
 # example against local WSS server:
 ixwebsocket_example wss://127.0.0.1:9450 test/fixtures/trusted-ca-crt.pem hello
+```
+
+## add_subdirectory usage
+
+```cmake
+add_subdirectory(path/to/native-tls-shim)
+
+# then add dependencies that call find_package(OpenSSL)
+# (native_tls_shim propagates its FindOpenSSL module path)
 ```
 
 ## FetchContent usage
@@ -107,18 +151,24 @@ TLS fixture certificates are provided in:
 Current test set covers:
 
 - cpp-httplib HTTPS client
-- cpp-httplib local SSL server roundtrip
+- cpp-httplib local HTTPS server roundtrip
 - cpp-httplib peer verification disabled
 - cpp-httplib hostname mismatch failure
 - cpp-httplib in-memory CA loading
+- cpp-httplib spoofed-CA rejection
 - cpp-httplib peer certificate inspection callback
 - cpp-httplib mTLS (client cert required)
+- wildcard host validation
+- cipher list validation
+- private-key/certificate mismatch handling
 - EVP MD5/SHA-256 vectors
 - IXWebSocket public WSS client
 - IXWebSocket local WSS server roundtrip
 - IXWebSocket peer verification disabled
 - IX Http TLS matrix (trusted/untrusted/hostname/in-memory-CA)
 - IXWebSocket mTLS (client cert required)
+- TLS 1.3-only interop runner (all non-Schannel backends)
+- standalone Asio HTTPS roundtrip runner (mbedTLS backend)
 
 ## Cipher suites
 
@@ -129,7 +179,5 @@ to AEAD suites; empty/unsupported lists are rejected.
 
 ## Current mbedTLS backend note
 
-For interoperability and compatibility with verification-disabled mode,
-the mbedTLS backend is currently configured with a TLS 1.2 max version.
-TLS 1.3 enablement can be revisited once verification behavior is aligned
-across all compatibility paths.
+The mbedTLS backend configures max protocol version to TLS 1.3 when the
+underlying mbedTLS build has TLS 1.3 enabled; otherwise it falls back to TLS 1.2.
