@@ -61,15 +61,11 @@
 #include <unistd.h>
 #endif
 
-inline void set_error_message(const std::string& msg, int reason = 1,
-                              int lib = ERR_LIB_X509) {
-  native_tls::set_error_message(msg, reason, lib);
-}
-
-inline void clear_error_message() { native_tls::clear_error_message(); }
-
+using native_tls::clear_error_message;
+using native_tls::close_socket_fd;
 using native_tls::extract_dn_component;
 using native_tls::is_ip_literal;
+using native_tls::set_error_message;
 using native_tls::set_fd_nonblocking;
 using native_tls::trim;
 using native_tls::wildcard_match;
@@ -79,14 +75,6 @@ using socket_len_t = int;
 #else
 using socket_len_t = socklen_t;
 #endif
-
-int close_socket_fd(int fd) {
-#ifdef _WIN32
-  return closesocket(fd);
-#else
-  return close(fd);
-#endif
-}
 
 time_t timegm_utc(std::tm* tmv) {
 #ifdef _WIN32
@@ -105,15 +93,6 @@ int map_mbedtls_to_ssl_error(int ret) {
   return SSL_ERROR_SSL;
 }
 
-struct ssl_method_st {
-  int endpoint;
-};
-
-struct x509_name_st {
-  std::string text;
-  std::string common_name;
-};
-
 struct x509_st {
   mbedtls_x509_crt crt;
   int refs = 1;
@@ -125,25 +104,6 @@ struct x509_st {
 
   x509_st() { mbedtls_x509_crt_init(&crt); }
   ~x509_st() { mbedtls_x509_crt_free(&crt); }
-};
-
-struct x509_crl_st {};
-
-struct x509_object_st {
-  int type = X509_LU_X509;
-  X509* cert = nullptr;
-};
-
-struct stack_st_X509_OBJECT {
-  std::vector<x509_object_st> items;
-};
-
-struct stack_st_X509_NAME {
-  std::vector<X509_NAME*> names;
-};
-
-struct stack_x509_info_st {
-  std::vector<X509_INFO*> items;
 };
 
 struct x509_store_st {
@@ -159,18 +119,6 @@ struct x509_store_st {
     }
     mbedtls_x509_crt_free(&ca_chain);
   }
-};
-
-struct x509_verify_param_st {
-  std::string host;
-  unsigned int hostflags = 0;
-};
-
-struct x509_store_ctx_st {
-  SSL* ssl = nullptr;
-  X509* current_cert = nullptr;
-  int error = X509_V_OK;
-  int depth = 0;
 };
 
 struct bio_method_st {
@@ -305,8 +253,6 @@ struct ssl_st {
 };
 
 const ssl_method_st g_any_method{0};
-const ssl_method_st g_client_method{MBEDTLS_SSL_IS_CLIENT};
-const ssl_method_st g_server_method{MBEDTLS_SSL_IS_SERVER};
 const bio_method_st g_mem_method{1};
 
 const EVP_MD g_md5{MBEDTLS_MD_MD5};
@@ -758,39 +704,9 @@ int ssl_recv_bio_cb(void* ctx, unsigned char* buf, size_t len) {
 
 extern "C" {
 
+#include "tls_shared_exports.inl"
+
 /* ===== BIO ===== */
-BIO* BIO_new_socket(int sock, int close_flag) {
-  auto* bio = new BIO();
-  bio->kind = BioKind::Socket;
-  bio->fd = sock;
-  bio->close_on_free = close_flag != BIO_NOCLOSE;
-  return bio;
-}
-
-void BIO_set_nbio(BIO* bio, long on) {
-  if (!bio || bio->kind != BioKind::Socket || bio->fd < 0) return;
-  set_fd_nonblocking(bio->fd, on != 0);
-}
-
-BIO* BIO_new_mem_buf(const void* buf, int len) {
-  auto* bio = new BIO();
-  bio->kind = BioKind::Memory;
-  if (buf) {
-    if (len < 0) {
-      auto* c = static_cast<const char*>(buf);
-      len = static_cast<int>(std::strlen(c));
-    }
-    bio->data.assign(static_cast<const unsigned char*>(buf),
-                     static_cast<const unsigned char*>(buf) + len);
-  }
-  return bio;
-}
-
-BIO* BIO_new(const BIO_METHOD* method) {
-  if (!method || method != &g_mem_method) return nullptr;
-  return BIO_new_mem_buf(nullptr, 0);
-}
-
 BIO* BIO_new_file(const char* filename, const char* mode) {
   if (!filename || !mode || std::strchr(mode, 'r') == nullptr) return nullptr;
   std::ifstream ifs(filename, std::ios::binary);
@@ -812,8 +728,6 @@ int BIO_new_bio_pair(BIO** bio1, size_t /*writebuf1*/, BIO** bio2, size_t /*writ
   *bio2 = b;
   return 1;
 }
-
-const BIO_METHOD* BIO_s_mem(void) { return &g_mem_method; }
 
 int BIO_read(BIO* bio, void* data, int len) {
   if (!bio || !data || len <= 0) return -1;
@@ -893,13 +807,7 @@ int BIO_free(BIO* a) {
   return 1;
 }
 
-void BIO_free_all(BIO* a) { (void)BIO_free(a); }
-
 /* ===== EVP (digest + pkey lifecycle) ===== */
-EVP_MD_CTX* EVP_MD_CTX_new(void) { return new EVP_MD_CTX(); }
-
-void EVP_MD_CTX_free(EVP_MD_CTX* ctx) { delete ctx; }
-
 int EVP_DigestInit_ex(EVP_MD_CTX* ctx, const EVP_MD* type, void* /*engine*/) {
   if (!ctx || !type) return 0;
   mbedtls_md_free(&ctx->md);
@@ -928,10 +836,6 @@ int EVP_DigestFinal_ex(EVP_MD_CTX* ctx, unsigned char* md, unsigned int* s) {
   }
   return 1;
 }
-
-const EVP_MD* EVP_md5(void) { return &g_md5; }
-const EVP_MD* EVP_sha256(void) { return &g_sha256; }
-const EVP_MD* EVP_sha512(void) { return &g_sha512; }
 
 EVP_PKEY* d2i_PrivateKey_bio(BIO* bp, EVP_PKEY** a) {
   if (!bp) return nullptr;
@@ -976,15 +880,6 @@ int EVP_PKEY_is_a(const EVP_PKEY* pkey, const char* name) {
 void EVP_PKEY_free(EVP_PKEY* pkey) { delete pkey; }
 
 /* ===== X509 ===== */
-X509* d2i_X509(X509** px, const unsigned char** in, int len) {
-  if (!in || !*in || len <= 0) return nullptr;
-  auto* out = x509_from_der(*in, static_cast<size_t>(len));
-  if (!out) return nullptr;
-  *in += len;
-  if (px) *px = out;
-  return out;
-}
-
 int i2d_X509(const X509* x, unsigned char** out) {
   if (!x || !x->crt.raw.p) return -1;
   int len = static_cast<int>(x->crt.raw.len);
@@ -994,204 +889,7 @@ int i2d_X509(const X509* x, unsigned char** out) {
   return len;
 }
 
-void X509_free(X509* cert) {
-  if (!cert) return;
-  cert->refs--;
-  if (cert->refs <= 0) {
-    delete cert;
-  }
-}
-
-int X509_up_ref(X509* cert) {
-  if (!cert) return 0;
-  cert->refs++;
-  return 1;
-}
-
-X509_NAME* X509_get_subject_name(const X509* x) {
-  if (!x) return nullptr;
-  return const_cast<X509_NAME*>(&x->subject_name);
-}
-
-X509_NAME* X509_get_issuer_name(const X509* x) {
-  if (!x) return nullptr;
-  return const_cast<X509_NAME*>(&x->issuer_name);
-}
-
-ASN1_INTEGER* X509_get_serialNumber(X509* x) {
-  if (!x) return nullptr;
-  return &x->serial;
-}
-
-const ASN1_TIME* X509_get0_notBefore(const X509* x) {
-  if (!x) return nullptr;
-  return &x->not_before;
-}
-
-const ASN1_TIME* X509_get0_notAfter(const X509* x) {
-  if (!x) return nullptr;
-  return &x->not_after;
-}
-
-char* X509_NAME_oneline(const X509_NAME* a, char* buf, int size) {
-  if (!a || !buf || size <= 0) return nullptr;
-  auto n = (std::min)(static_cast<int>(a->text.size()), size - 1);
-  std::memcpy(buf, a->text.data(), n);
-  buf[n] = '\0';
-  return buf;
-}
-
-int X509_NAME_get_text_by_NID(X509_NAME* name, int nid, char* buf, int len) {
-  if (!name || !buf || len <= 0) return -1;
-  std::string val;
-  if (nid == NID_commonName) val = name->common_name;
-  else return -1;
-  auto n = (std::min)(static_cast<int>(val.size()), len - 1);
-  std::memcpy(buf, val.data(), n);
-  buf[n] = '\0';
-  return n;
-}
-
-X509_NAME* X509_NAME_dup(const X509_NAME* name) {
-  if (!name) return nullptr;
-  auto* n = new X509_NAME();
-  n->text = name->text;
-  n->common_name = name->common_name;
-  return n;
-}
-
-void X509_NAME_free(X509_NAME* name) { delete name; }
-
-int X509_check_host(X509* x, const char* chk, size_t chklen,
-                    unsigned int /*flags*/, char** peername) {
-  if (!x || !chk) return 0;
-  std::string host = chklen ? std::string(chk, chklen) : std::string(chk);
-  bool ok = cert_matches_hostname(x, host, false);
-  if (ok && peername) {
-    auto* out = static_cast<char*>(OPENSSL_malloc(host.size() + 1));
-    if (out) {
-      std::memcpy(out, host.data(), host.size());
-      out[host.size()] = '\0';
-      *peername = out;
-    }
-  }
-  return ok ? 1 : 0;
-}
-
-int X509_check_ip_asc(X509* x, const char* ipasc, unsigned int /*flags*/) {
-  if (!x || !ipasc) return 0;
-  return cert_matches_hostname(x, ipasc, true) ? 1 : 0;
-}
-
-const char* X509_verify_cert_error_string(long n) {
-  switch (n) {
-    case X509_V_OK: return "ok";
-    case X509_V_ERR_CERT_HAS_EXPIRED: return "certificate has expired";
-    case X509_V_ERR_CERT_NOT_YET_VALID: return "certificate is not yet valid";
-    case X509_V_ERR_CERT_REVOKED: return "certificate revoked";
-    case X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT: return "self signed certificate";
-    case X509_V_ERR_HOSTNAME_MISMATCH: return "hostname mismatch";
-    default: return "certificate verify error";
-  }
-}
-
 /* ===== X509 store ===== */
-X509_STORE* X509_STORE_new(void) { return new X509_STORE(); }
-
-void X509_STORE_free(X509_STORE* store) { delete store; }
-
-int X509_STORE_add_cert(X509_STORE* store, X509* cert) {
-  return add_cert_to_store(store, cert, true) ? 1 : 0;
-}
-
-int X509_STORE_add_crl(X509_STORE* /*store*/, X509_CRL* /*crl*/) { return 1; }
-
-void X509_STORE_set_flags(X509_STORE* store, unsigned long flags) {
-  if (store) store->flags |= flags;
-}
-
-STACK_OF_X509_OBJECT* X509_STORE_get0_objects(const X509_STORE* store) {
-  if (!store) return nullptr;
-  auto* s = const_cast<X509_STORE*>(store);
-  s->object_cache.items.clear();
-  s->object_cache.items.reserve(s->certs.size());
-  for (auto* cert : s->certs) {
-    s->object_cache.items.push_back({X509_LU_X509, cert});
-  }
-  return &s->object_cache;
-}
-
-int X509_OBJECT_get_type(const X509_OBJECT* obj) { return obj ? obj->type : 0; }
-
-X509* X509_OBJECT_get0_X509(const X509_OBJECT* obj) { return obj ? obj->cert : nullptr; }
-
-int sk_X509_OBJECT_num(const STACK_OF_X509_OBJECT* st) {
-  return st ? static_cast<int>(st->items.size()) : 0;
-}
-
-X509_OBJECT* sk_X509_OBJECT_value(const STACK_OF_X509_OBJECT* st, int i) {
-  if (!st || i < 0 || static_cast<size_t>(i) >= st->items.size()) return nullptr;
-  return const_cast<X509_OBJECT*>(&st->items[static_cast<size_t>(i)]);
-}
-
-/* ===== verify param/store ctx ===== */
-int X509_VERIFY_PARAM_set1_host(X509_VERIFY_PARAM* param, const char* name, size_t namelen) {
-  if (!param || !name) return 0;
-  param->host = namelen ? std::string(name, namelen) : std::string(name);
-  return 1;
-}
-
-void X509_VERIFY_PARAM_set_hostflags(X509_VERIFY_PARAM* param, unsigned int flags) {
-  if (param) param->hostflags = flags;
-}
-
-X509* X509_STORE_CTX_get_current_cert(X509_STORE_CTX* ctx) {
-  return ctx ? ctx->current_cert : nullptr;
-}
-
-int X509_STORE_CTX_get_error(X509_STORE_CTX* ctx) {
-  return ctx ? ctx->error : X509_V_ERR_UNSPECIFIED;
-}
-
-int X509_STORE_CTX_get_error_depth(X509_STORE_CTX* ctx) { return ctx ? ctx->depth : 0; }
-
-void* X509_STORE_CTX_get_ex_data(X509_STORE_CTX* ctx, int idx) {
-  if (!ctx || idx != 0) return nullptr;
-  return ctx->ssl;
-}
-
-/* ===== GENERAL_NAME stack ===== */
-struct stack_st_GENERAL_NAME {
-  std::vector<GENERAL_NAME*> names;
-};
-
-int native_sk_GENERAL_NAME_num(const STACK_OF_GENERAL_NAME* st) {
-  return st ? static_cast<int>(st->names.size()) : 0;
-}
-
-GENERAL_NAME* native_sk_GENERAL_NAME_value(const STACK_OF_GENERAL_NAME* st, int i) {
-  if (!st || i < 0 || static_cast<size_t>(i) >= st->names.size()) return nullptr;
-  return st->names[static_cast<size_t>(i)];
-}
-
-void GENERAL_NAME_free(GENERAL_NAME* a) {
-  if (!a) return;
-  delete a->d.ptr;
-  delete a;
-}
-
-void sk_GENERAL_NAME_pop_free(STACK_OF_GENERAL_NAME* st, void (*freefn)(GENERAL_NAME*)) {
-  if (!st) return;
-  for (auto* n : st->names) {
-    if (freefn) freefn(n);
-  }
-  delete st;
-}
-
-void GENERAL_NAMES_free(STACK_OF_GENERAL_NAME* st) {
-  sk_GENERAL_NAME_pop_free(st, GENERAL_NAME_free);
-}
-
 void* X509_get_ext_d2i(X509* x, int nid, int* /*crit*/, int* /*idx*/) {
   if (!x || nid != NID_subject_alt_name) return nullptr;
 
@@ -1245,53 +943,6 @@ void* X509_get_ext_d2i(X509* x, int nid, int* /*crit*/, int* /*idx*/) {
   return out;
 }
 
-/* ===== X509_NAME stack ===== */
-STACK_OF_X509_NAME* sk_X509_NAME_new_null(void) { return new STACK_OF_X509_NAME(); }
-
-int sk_X509_NAME_push(STACK_OF_X509_NAME* sk, X509_NAME* name) {
-  if (!sk || !name) return 0;
-  sk->names.push_back(name);
-  return 1;
-}
-
-int sk_X509_NAME_num(const STACK_OF_X509_NAME* sk) {
-  return sk ? static_cast<int>(sk->names.size()) : 0;
-}
-
-void sk_X509_NAME_free(STACK_OF_X509_NAME* sk) { delete sk; }
-
-void sk_X509_NAME_pop_free(STACK_OF_X509_NAME* sk, void (*free_fn)(X509_NAME*)) {
-  if (!sk) return;
-  for (auto* n : sk->names) {
-    if (free_fn) free_fn(n);
-  }
-  delete sk;
-}
-
-/* ===== X509_INFO stack ===== */
-int sk_X509_INFO_num(const STACK_OF_X509_INFO* st) {
-  return st ? static_cast<int>(st->items.size()) : 0;
-}
-
-X509_INFO* sk_X509_INFO_value(const STACK_OF_X509_INFO* st, int i) {
-  if (!st || i < 0 || static_cast<size_t>(i) >= st->items.size()) return nullptr;
-  return st->items[static_cast<size_t>(i)];
-}
-
-void X509_INFO_free(X509_INFO* info) {
-  if (!info) return;
-  if (info->x509) X509_free(info->x509);
-  delete info;
-}
-
-void sk_X509_INFO_pop_free(STACK_OF_X509_INFO* st, void (*freefn)(X509_INFO*)) {
-  if (!st) return;
-  for (auto* i : st->items) {
-    if (freefn) freefn(i);
-  }
-  delete st;
-}
-
 /* ===== PEM ===== */
 X509* PEM_read_bio_X509(BIO* bp, X509** x, void* /*cb*/, void* /*u*/) {
   if (!bp) return nullptr;
@@ -1312,10 +963,6 @@ X509* PEM_read_bio_X509(BIO* bp, X509** x, void* /*cb*/, void* /*u*/) {
   refresh_x509_fields(cert);
   if (x) *x = cert;
   return cert;
-}
-
-X509* PEM_read_bio_X509_AUX(BIO* bp, X509** x, void* cb, void* u) {
-  return PEM_read_bio_X509(bp, x, cb, u);
 }
 
 EVP_PKEY* PEM_read_bio_PrivateKey(BIO* bp, EVP_PKEY** x, void* /*cb*/, void* u) {
@@ -1390,29 +1037,9 @@ int PEM_write_bio_PrivateKey(BIO* bp, EVP_PKEY* x, const void* /*enc*/, unsigned
   return 1;
 }
 
-STACK_OF_X509_INFO* PEM_X509_INFO_read_bio(BIO* bp, STACK_OF_X509_INFO* sk,
-                                           void* /*cb*/, void* /*u*/) {
-  if (!bp) return nullptr;
-  if (!sk) sk = new STACK_OF_X509_INFO();
-
-  while (true) {
-    auto* cert = PEM_read_bio_X509(bp, nullptr, nullptr, nullptr);
-    if (!cert) break;
-    auto* info = new X509_INFO();
-    info->x509 = cert;
-    info->crl = nullptr;
-    sk->items.push_back(info);
-  }
-  return sk;
-}
-
 /* ===== SSL methods/context ===== */
 const SSL_METHOD* TLS_method(void) { return &g_any_method; }
-const SSL_METHOD* TLS_client_method(void) { return &g_client_method; }
-const SSL_METHOD* TLS_server_method(void) { return &g_server_method; }
 const SSL_METHOD* SSLv23_method(void) { return &g_any_method; }
-const SSL_METHOD* SSLv23_client_method(void) { return &g_client_method; }
-const SSL_METHOD* SSLv23_server_method(void) { return &g_server_method; }
 
 SSL_CTX* SSL_CTX_new(const SSL_METHOD* method) {
   auto* ctx = new SSL_CTX();
@@ -1427,8 +1054,6 @@ SSL_CTX* SSL_CTX_new(const SSL_METHOD* method) {
 
   return ctx;
 }
-
-void SSL_CTX_free(SSL_CTX* ctx) { delete ctx; }
 
 void SSL_CTX_set_verify(SSL_CTX* ctx, int mode,
                         int (*verify_callback)(int, X509_STORE_CTX*)) {
@@ -1446,47 +1071,10 @@ int SSL_CTX_get_verify_mode(const SSL_CTX* ctx) {
 int (*SSL_CTX_get_verify_callback(const SSL_CTX* ctx))(int, X509_STORE_CTX*) {
   return ctx ? ctx->verify_callback : nullptr;
 }
-
-void SSL_CTX_set_verify_depth(SSL_CTX* ctx, int depth) {
-  if (ctx) ctx->verify_depth = depth;
-}
-
-long SSL_CTX_set_mode(SSL_CTX* ctx, long mode) {
-  if (!ctx) return 0;
-  ctx->mode |= mode;
-  return ctx->mode;
-}
-
-long SSL_CTX_clear_mode(SSL_CTX* ctx, long mode) {
-  if (!ctx) return 0;
-  ctx->mode &= ~mode;
-  return ctx->mode;
-}
-
-long SSL_CTX_set_options(SSL_CTX* ctx, long options) {
-  if (!ctx) return 0;
-  ctx->options |= options;
-  return ctx->options;
-}
-
 long SSL_CTX_clear_options(SSL_CTX* ctx, long options) {
   if (!ctx) return 0;
   ctx->options &= ~options;
   return ctx->options;
-}
-
-int SSL_CTX_set_session_cache_mode(SSL_CTX* ctx, int mode) {
-  if (!ctx) return 0;
-  ctx->session_cache_mode = mode;
-  return mode;
-}
-
-static std::string normalize_cipher_token(std::string token) {
-  token = trim(token);
-  for (auto& c : token) {
-    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-  }
-  return token;
 }
 
 static void append_default_ciphers(std::vector<int>& out) {
@@ -1557,7 +1145,7 @@ static bool parse_cipher_list_string(const char* str, std::vector<int>& out) {
   std::string token;
   auto flush = [&]() {
     if (token.empty()) return;
-    std::string normalized = normalize_cipher_token(token);
+    std::string normalized = native_tls::normalize(token);
     token.clear();
     if (normalized.empty()) return;
     if (normalized[0] == '!') return;
@@ -1599,10 +1187,6 @@ int SSL_CTX_set_cipher_list(SSL_CTX* ctx, const char* str) {
   return 1;
 }
 
-int SSL_CTX_set_ciphersuites(SSL_CTX* ctx, const char* str) {
-  return SSL_CTX_set_cipher_list(ctx, str);
-}
-
 int SSL_CTX_load_verify_locations(SSL_CTX* ctx, const char* ca_file, const char* ca_path) {
   if (!ctx || !ctx->cert_store) return 0;
   bool loaded = false;
@@ -1630,10 +1214,6 @@ int SSL_CTX_set_default_verify_paths(SSL_CTX* ctx) {
   bool loaded = load_default_ca_paths(ctx->cert_store);
   if (loaded) apply_ctx_ca_store(ctx);
   return loaded ? 1 : 0;
-}
-
-int SSL_CTX_default_verify_paths(SSL_CTX* ctx) {
-  return SSL_CTX_set_default_verify_paths(ctx);
 }
 
 int SSL_CTX_use_certificate_file(SSL_CTX* ctx, const char* file, int /*type*/) {
@@ -1755,16 +1335,8 @@ pem_password_cb* SSL_CTX_get_default_passwd_cb(SSL_CTX* ctx) {
   return ctx ? ctx->passwd_cb : nullptr;
 }
 
-void SSL_CTX_set_default_passwd_cb_userdata(SSL_CTX* ctx, void* u) {
-  if (ctx) ctx->passwd_userdata = u;
-}
-
 void* SSL_CTX_get_default_passwd_cb_userdata(SSL_CTX* ctx) {
   return ctx ? ctx->passwd_userdata : nullptr;
-}
-
-X509_STORE* SSL_CTX_get_cert_store(const SSL_CTX* ctx) {
-  return ctx ? ctx->cert_store : nullptr;
 }
 
 void SSL_CTX_set_cert_store(SSL_CTX* ctx, X509_STORE* store) {
@@ -1773,12 +1345,6 @@ void SSL_CTX_set_cert_store(SSL_CTX* ctx, X509_STORE* store) {
   if (ctx->cert_store) X509_STORE_free(ctx->cert_store);
   ctx->cert_store = store;
   apply_ctx_ca_store(ctx);
-}
-
-void SSL_CTX_set_client_CA_list(SSL_CTX* ctx, STACK_OF_X509_NAME* list) {
-  if (!ctx) return;
-  if (ctx->client_ca_list) sk_X509_NAME_pop_free(ctx->client_ca_list, X509_NAME_free);
-  ctx->client_ca_list = list;
 }
 
 int SSL_CTX_add_extra_chain_cert(SSL_CTX* /*ctx*/, X509* x509) {
@@ -1869,8 +1435,6 @@ SSL* SSL_new(SSL_CTX* ctx) {
   return ssl;
 }
 
-void SSL_free(SSL* ssl) { delete ssl; }
-
 int SSL_set_fd(SSL* ssl, int fd) {
   if (!ssl) return 0;
   ssl->fd = fd;
@@ -1906,8 +1470,6 @@ void SSL_set_bio(SSL* ssl, BIO* rbio, BIO* wbio) {
   }
 }
 
-BIO* SSL_get_rbio(const SSL* ssl) { return ssl ? ssl->rbio : nullptr; }
-
 int SSL_set_tlsext_host_name(SSL* ssl, const char* name) {
   if (!ssl || !name) return 0;
   ssl->hostname = name;
@@ -1919,14 +1481,6 @@ int SSL_set_tlsext_host_name(SSL* ssl, const char* name) {
     return 1;
   }
   return 1;
-}
-
-long SSL_ctrl(SSL* ssl, int cmd, long larg, void* parg) {
-  if (!ssl) return 0;
-  if (cmd == SSL_CTRL_SET_TLSEXT_HOSTNAME && larg == TLSEXT_NAMETYPE_host_name) {
-    return SSL_set_tlsext_host_name(ssl, static_cast<const char*>(parg));
-  }
-  return 0;
 }
 
 void SSL_set_verify(SSL* ssl, int mode,
@@ -1964,8 +1518,6 @@ long SSL_set_mode(SSL* ssl, long mode) {
   ssl->mode |= mode;
   return ssl->mode;
 }
-
-int SSL_set_ecdh_auto(SSL* /*ssl*/, int /*onoff*/) { return 1; }
 
 int SSL_connect(SSL* ssl) {
   if (!ssl || !ssl->ssl_setup) return -1;
@@ -2149,11 +1701,6 @@ int SSL_shutdown(SSL* ssl) {
   return -1;
 }
 
-int SSL_get_error(const SSL* ssl, int /*ret*/) {
-  if (!ssl) return SSL_ERROR_SSL;
-  return ssl->last_error;
-}
-
 int SSL_get_shutdown(const SSL* ssl) {
   return ssl ? ssl->shutdown_state : 0;
 }
@@ -2169,8 +1716,6 @@ X509* SSL_get_peer_certificate(const SSL* ssl) {
   return x509_from_der(cert->raw.p, cert->raw.len);
 }
 
-X509* SSL_get1_peer_certificate(const SSL* ssl) { return SSL_get_peer_certificate(ssl); }
-
 long SSL_get_verify_result(const SSL* ssl) {
   if (!ssl) return X509_V_ERR_UNSPECIFIED;
   if (ssl->ignore_verify_result) return X509_V_OK;
@@ -2183,24 +1728,9 @@ long SSL_get_verify_result(const SSL* ssl) {
   return X509_V_ERR_UNSPECIFIED;
 }
 
-X509_VERIFY_PARAM* SSL_get0_param(SSL* ssl) {
-  if (!ssl) return nullptr;
-  return &ssl->param;
-}
-
-int SSL_get_ex_data_X509_STORE_CTX_idx(void) { return 0; }
-
 const char* SSL_get_servername(const SSL* ssl, const int type) {
   if (!ssl || type != TLSEXT_NAMETYPE_host_name) return nullptr;
   return ssl->hostname.empty() ? nullptr : ssl->hostname.c_str();
-}
-
-void SSL_get0_alpn_selected(const SSL* ssl, const unsigned char** data, unsigned int* len) {
-  if (data) *data = nullptr;
-  if (len) *len = 0;
-  if (!ssl || ssl->selected_alpn.empty()) return;
-  if (data) *data = reinterpret_cast<const unsigned char*>(ssl->selected_alpn.data());
-  if (len) *len = static_cast<unsigned int>(ssl->selected_alpn.size());
 }
 
 void SSL_clear_mode(SSL* ssl, long mode) {

@@ -3,7 +3,9 @@
 #include "openssl/crypto.h"
 #include "openssl/err.h"
 #include "openssl/evp.h"
+#include "openssl/pem.h"
 #include "openssl/ssl.h"
+#include "openssl/x509.h"
 
 #include <algorithm>
 #include <array>
@@ -25,6 +27,7 @@
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <unistd.h>
 #endif
 
 namespace {
@@ -90,6 +93,14 @@ std::string trim(std::string s) {
   return s;
 }
 
+std::string normalize(std::string s) {
+  s = trim(s);
+  for (auto& c : s) {
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  return s;
+}
+
 std::string extract_dn_component(const std::string& dn, const std::string& key) {
   auto pattern = key + "=";
   auto pos = dn.find(pattern);
@@ -114,6 +125,14 @@ bool wildcard_match(const std::string& pattern, const std::string& host) {
   if (left.empty() || left.find('.') != std::string::npos) return false;
 
   return true;
+}
+
+int close_socket_fd(int fd) {
+#ifdef _WIN32
+  return closesocket(fd);
+#else
+  return close(fd);
+#endif
 }
 
 bool set_fd_nonblocking(int fd, bool on) {
@@ -266,6 +285,205 @@ char* BN_bn2hex(const BIGNUM* a) {
 }
 
 void BN_free(BIGNUM* a) { delete a; }
+
+int X509_OBJECT_get_type(const X509_OBJECT* obj) { return obj ? obj->type : 0; }
+
+X509* X509_OBJECT_get0_X509(const X509_OBJECT* obj) { return obj ? obj->cert : nullptr; }
+
+int sk_X509_OBJECT_num(const STACK_OF_X509_OBJECT* st) {
+  return st ? static_cast<int>(st->items.size()) : 0;
+}
+
+X509_OBJECT* sk_X509_OBJECT_value(const STACK_OF_X509_OBJECT* st, int i) {
+  if (!st || i < 0 || static_cast<size_t>(i) >= st->items.size()) return nullptr;
+  return const_cast<X509_OBJECT*>(&st->items[static_cast<size_t>(i)]);
+}
+
+int X509_VERIFY_PARAM_set1_host(X509_VERIFY_PARAM* param, const char* name, size_t namelen) {
+  if (!param || !name) return 0;
+  param->host = namelen ? std::string(name, namelen) : std::string(name);
+  return 1;
+}
+
+void X509_VERIFY_PARAM_set_hostflags(X509_VERIFY_PARAM* param, unsigned int flags) {
+  if (param) param->hostflags = flags;
+}
+
+X509* X509_STORE_CTX_get_current_cert(X509_STORE_CTX* ctx) {
+  return ctx ? ctx->current_cert : nullptr;
+}
+
+int X509_STORE_CTX_get_error(X509_STORE_CTX* ctx) {
+  return ctx ? ctx->error : X509_V_ERR_UNSPECIFIED;
+}
+
+int X509_STORE_CTX_get_error_depth(X509_STORE_CTX* ctx) { return ctx ? ctx->depth : 0; }
+
+void* X509_STORE_CTX_get_ex_data(X509_STORE_CTX* ctx, int idx) {
+  if (!ctx || idx != 0) return nullptr;
+  return ctx->ssl;
+}
+
+int native_sk_GENERAL_NAME_num(const STACK_OF_GENERAL_NAME* st) {
+  return st ? static_cast<int>(st->names.size()) : 0;
+}
+
+GENERAL_NAME* native_sk_GENERAL_NAME_value(const STACK_OF_GENERAL_NAME* st, int i) {
+  if (!st || i < 0 || static_cast<size_t>(i) >= st->names.size()) return nullptr;
+  return st->names[static_cast<size_t>(i)];
+}
+
+void GENERAL_NAME_free(GENERAL_NAME* a) {
+  if (!a) return;
+  delete a->d.ptr;
+  delete a;
+}
+
+void sk_GENERAL_NAME_pop_free(STACK_OF_GENERAL_NAME* st, void (*freefn)(GENERAL_NAME*)) {
+  if (!st) return;
+  for (auto* n : st->names) {
+    if (freefn) freefn(n);
+  }
+  delete st;
+}
+
+void GENERAL_NAMES_free(STACK_OF_GENERAL_NAME* st) {
+  sk_GENERAL_NAME_pop_free(st, GENERAL_NAME_free);
+}
+
+STACK_OF_X509_NAME* sk_X509_NAME_new_null(void) { return new STACK_OF_X509_NAME(); }
+
+int sk_X509_NAME_push(STACK_OF_X509_NAME* sk, X509_NAME* name) {
+  if (!sk || !name) return 0;
+  sk->names.push_back(name);
+  return 1;
+}
+
+int sk_X509_NAME_num(const STACK_OF_X509_NAME* sk) {
+  return sk ? static_cast<int>(sk->names.size()) : 0;
+}
+
+void sk_X509_NAME_free(STACK_OF_X509_NAME* sk) { delete sk; }
+
+void sk_X509_NAME_pop_free(STACK_OF_X509_NAME* sk, void (*free_fn)(X509_NAME*)) {
+  if (!sk) return;
+  for (auto* n : sk->names) {
+    if (free_fn) free_fn(n);
+  }
+  delete sk;
+}
+
+int sk_X509_INFO_num(const STACK_OF_X509_INFO* st) {
+  return st ? static_cast<int>(st->items.size()) : 0;
+}
+
+X509_INFO* sk_X509_INFO_value(const STACK_OF_X509_INFO* st, int i) {
+  if (!st || i < 0 || static_cast<size_t>(i) >= st->items.size()) return nullptr;
+  return st->items[static_cast<size_t>(i)];
+}
+
+void X509_INFO_free(X509_INFO* info) {
+  if (!info) return;
+  if (info->x509) X509_free(info->x509);
+  delete info;
+}
+
+void sk_X509_INFO_pop_free(STACK_OF_X509_INFO* st, void (*freefn)(X509_INFO*)) {
+  if (!st) return;
+  for (auto* i : st->items) {
+    if (freefn) freefn(i);
+  }
+  delete st;
+}
+
+char* X509_NAME_oneline(const X509_NAME* a, char* buf, int size) {
+  if (!a || !buf || size <= 0) return nullptr;
+  auto n = (std::min)(static_cast<int>(a->text.size()), size - 1);
+  std::memcpy(buf, a->text.data(), n);
+  buf[n] = '\0';
+  return buf;
+}
+
+int X509_NAME_get_text_by_NID(X509_NAME* name, int nid, char* buf, int len) {
+  if (!name || !buf || len <= 0) return -1;
+  std::string val;
+  if (nid == NID_commonName)
+    val = name->common_name;
+  else
+    return -1;
+  auto n = (std::min)(static_cast<int>(val.size()), len - 1);
+  std::memcpy(buf, val.data(), n);
+  buf[n] = '\0';
+  return n;
+}
+
+X509_NAME* X509_NAME_dup(const X509_NAME* name) {
+  if (!name) return nullptr;
+  auto* n = new X509_NAME();
+  n->text = name->text;
+  n->common_name = name->common_name;
+  return n;
+}
+
+void X509_NAME_free(X509_NAME* name) { delete name; }
+
+const char* X509_verify_cert_error_string(long n) {
+  switch (n) {
+    case X509_V_OK: return "ok";
+    case X509_V_ERR_CERT_HAS_EXPIRED: return "certificate has expired";
+    case X509_V_ERR_CERT_NOT_YET_VALID: return "certificate is not yet valid";
+    case X509_V_ERR_CERT_REVOKED: return "certificate revoked";
+    case X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT: return "self signed certificate";
+    case X509_V_ERR_HOSTNAME_MISMATCH: return "hostname mismatch";
+    default: return "certificate verify error";
+  }
+}
+
+X509* PEM_read_bio_X509_AUX(BIO* bp, X509** x, void* cb, void* u) {
+  return PEM_read_bio_X509(bp, x, cb, u);
+}
+
+STACK_OF_X509_INFO* PEM_X509_INFO_read_bio(BIO* bp, STACK_OF_X509_INFO* sk,
+                                           void* /*cb*/, void* /*u*/) {
+  if (!bp) return nullptr;
+  if (!sk) sk = new STACK_OF_X509_INFO();
+
+  while (true) {
+    auto* cert = PEM_read_bio_X509(bp, nullptr, nullptr, nullptr);
+    if (!cert) break;
+    auto* info = new X509_INFO();
+    info->x509 = cert;
+    info->crl = nullptr;
+    sk->items.push_back(info);
+  }
+  return sk;
+}
+
+const SSL_METHOD* TLS_client_method(void) {
+  static const ssl_method_st method{0};
+  return &method;
+}
+
+const SSL_METHOD* TLS_server_method(void) {
+  static const ssl_method_st method{1};
+  return &method;
+}
+
+const SSL_METHOD* SSLv23_client_method(void) { return TLS_client_method(); }
+
+const SSL_METHOD* SSLv23_server_method(void) { return TLS_server_method(); }
+
+int SSL_CTX_set_ciphersuites(SSL_CTX* ctx, const char* str) {
+  return SSL_CTX_set_cipher_list(ctx, str);
+}
+
+int SSL_CTX_default_verify_paths(SSL_CTX* ctx) {
+  return SSL_CTX_set_default_verify_paths(ctx);
+}
+
+int SSL_set_ecdh_auto(SSL* /*ssl*/, int /*onoff*/) { return 1; }
+
+int SSL_get_ex_data_X509_STORE_CTX_idx(void) { return 0; }
 
 void SSL_set_app_data(SSL* ssl, void* arg) {
   if (!ssl) return;

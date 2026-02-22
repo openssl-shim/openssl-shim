@@ -1,5 +1,15 @@
 include(FetchContent)
 
+function(native_tls_shim_reset_openssl_find_state)
+  foreach(_var
+      OPENSSL_FOUND OpenSSL_FOUND
+      OPENSSL_VERSION OpenSSL_VERSION
+      OPENSSL_INCLUDE_DIR OPENSSL_LIBRARIES)
+    unset(${_var})
+    unset(${_var} CACHE)
+  endforeach()
+endfunction()
+
 set(_cpp_httplib_dir "${CMAKE_SOURCE_DIR}/test/cpp-httplib")
 set(_ixws_dir "${CMAKE_SOURCE_DIR}/test/IXWebSocket")
 set(_asio_include_dir "${CMAKE_SOURCE_DIR}/test/asio/asio/include")
@@ -12,6 +22,8 @@ set(HTTPLIB_USE_BROTLI_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
 set(HTTPLIB_USE_ZSTD_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
 set(HTTPLIB_TEST OFF CACHE BOOL "" FORCE)
 set(HTTPLIB_INSTALL OFF CACHE BOOL "" FORCE)
+
+native_tls_shim_reset_openssl_find_state()
 
 if(EXISTS "${_cpp_httplib_dir}/CMakeLists.txt")
   add_subdirectory("${_cpp_httplib_dir}" "${CMAKE_CURRENT_BINARY_DIR}/cpp-httplib" SYSTEM)
@@ -31,9 +43,9 @@ set(USE_SECURE_TRANSPORT OFF CACHE BOOL "" FORCE)
 set(USE_ZLIB OFF CACHE BOOL "" FORCE)
 set(BUILD_DEMO OFF CACHE BOOL "" FORCE)
 set(IXWEBSOCKET_INSTALL OFF CACHE BOOL "" FORCE)
-set(OPENSSL_FOUND TRUE CACHE BOOL "" FORCE)
-set(OPENSSL_INCLUDE_DIR "${CMAKE_SOURCE_DIR}" CACHE PATH "" FORCE)
-set(OPENSSL_LIBRARIES "OpenSSL::SSL;OpenSSL::Crypto" CACHE STRING "" FORCE)
+# Let IXWebSocket resolve OpenSSL via find_package(OpenSSL), which is provided
+# by this shim's FindOpenSSL/OpenSSLConfig logic.
+native_tls_shim_reset_openssl_find_state()
 
 if(EXISTS "${_ixws_dir}/CMakeLists.txt")
   add_subdirectory("${_ixws_dir}" "${CMAKE_CURRENT_BINARY_DIR}/IXWebSocket" SYSTEM)
