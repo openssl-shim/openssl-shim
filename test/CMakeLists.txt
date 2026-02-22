@@ -140,6 +140,21 @@ if(EXISTS "${_asio_include_dir}/asio.hpp")
   target_compile_definitions(test_asio_https_server PRIVATE ASIO_STANDALONE)
   target_link_libraries(test_asio_https_server PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 
+  add_executable(test_asio_https_server_asn1 test_asio_https_server_asn1.cpp)
+  target_include_directories(test_asio_https_server_asn1 PRIVATE "${_asio_include_dir}")
+  target_compile_definitions(test_asio_https_server_asn1 PRIVATE ASIO_STANDALONE)
+  target_link_libraries(test_asio_https_server_asn1 PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+
+  add_executable(test_asio_https_server_rsa_asn1 test_asio_https_server_rsa_asn1.cpp)
+  target_include_directories(test_asio_https_server_rsa_asn1 PRIVATE "${_asio_include_dir}")
+  target_compile_definitions(test_asio_https_server_rsa_asn1 PRIVATE ASIO_STANDALONE)
+  target_link_libraries(test_asio_https_server_rsa_asn1 PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+
+  add_executable(test_asio_https_server_chain_memory test_asio_https_server_chain_memory.cpp)
+  target_include_directories(test_asio_https_server_chain_memory PRIVATE "${_asio_include_dir}")
+  target_compile_definitions(test_asio_https_server_chain_memory PRIVATE ASIO_STANDALONE)
+  target_link_libraries(test_asio_https_server_chain_memory PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+
   add_executable(test_asio_https_client test_asio_https_client.cpp)
   target_include_directories(test_asio_https_client PRIVATE "${_asio_include_dir}")
   target_compile_definitions(test_asio_https_client PRIVATE ASIO_STANDALONE)
@@ -147,6 +162,9 @@ if(EXISTS "${_asio_include_dir}/asio.hpp")
 
   if(WIN32)
     target_link_libraries(test_asio_https_server PRIVATE ws2_32)
+    target_link_libraries(test_asio_https_server_asn1 PRIVATE ws2_32)
+    target_link_libraries(test_asio_https_server_rsa_asn1 PRIVATE ws2_32)
+    target_link_libraries(test_asio_https_server_chain_memory PRIVATE ws2_32)
     target_link_libraries(test_asio_https_client PRIVATE ws2_32)
   endif()
 endif()
@@ -175,7 +193,48 @@ if(EXISTS "${_asio_include_dir}/asio.hpp")
       --source-dir ${CMAKE_SOURCE_DIR}
       --server-bin $<TARGET_FILE:test_asio_https_server>
       --client-bin $<TARGET_FILE:test_asio_https_client>)
-  set_tests_properties(test_asio_https_roundtrip PROPERTIES TIMEOUT 60)
+
+  add_test(NAME test_asio_https_asn1_roundtrip
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/run_asio_https_variant_roundtrip.py
+      --source-dir ${CMAKE_SOURCE_DIR}
+      --port 9554
+      --server-bin $<TARGET_FILE:test_asio_https_server_asn1>
+      --client-bin $<TARGET_FILE:test_asio_https_client>
+      --server-cert ${CMAKE_SOURCE_DIR}/test/fixtures/trusted-server-crt.pem
+      --server-key ${CMAKE_SOURCE_DIR}/test/fixtures/trusted-server-key.pem
+      --server-cert-der ${CMAKE_SOURCE_DIR}/test/fixtures/trusted-server-crt.der
+      --server-key-der ${CMAKE_SOURCE_DIR}/test/fixtures/trusted-server-key.der
+      --client-ca ${CMAKE_SOURCE_DIR}/test/fixtures/trusted-ca-crt.pem)
+
+  add_test(NAME test_asio_https_rsa_asn1_roundtrip
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/run_asio_https_variant_roundtrip.py
+      --source-dir ${CMAKE_SOURCE_DIR}
+      --port 9555
+      --server-bin $<TARGET_FILE:test_asio_https_server_rsa_asn1>
+      --client-bin $<TARGET_FILE:test_asio_https_client>
+      --server-cert ${CMAKE_SOURCE_DIR}/test/fixtures/trusted-server-crt.pem
+      --server-key ${CMAKE_SOURCE_DIR}/test/fixtures/trusted-server-key.pem
+      --server-cert-der ${CMAKE_SOURCE_DIR}/test/fixtures/trusted-server-crt.der
+      --server-key-der ${CMAKE_SOURCE_DIR}/test/fixtures/trusted-server-key.der
+      --client-ca ${CMAKE_SOURCE_DIR}/test/fixtures/trusted-ca-crt.pem)
+
+  add_test(NAME test_asio_https_chain_memory_roundtrip
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/run_asio_https_variant_roundtrip.py
+      --source-dir ${CMAKE_SOURCE_DIR}
+      --port 9556
+      --server-bin $<TARGET_FILE:test_asio_https_server_chain_memory>
+      --client-bin $<TARGET_FILE:test_asio_https_client>
+      --server-chain-pem ${CMAKE_SOURCE_DIR}/test/fixtures/chain-server-fullchain-crt.pem
+      --server-cert ${CMAKE_SOURCE_DIR}/test/fixtures/chain-server-fullchain-crt.pem
+      --server-key ${CMAKE_SOURCE_DIR}/test/fixtures/chain-server-key.pem
+      --client-ca ${CMAKE_SOURCE_DIR}/test/fixtures/chain-root-ca-crt.pem)
+
+  set_tests_properties(
+    test_asio_https_roundtrip
+    test_asio_https_asn1_roundtrip
+    test_asio_https_rsa_asn1_roundtrip
+    test_asio_https_chain_memory_roundtrip
+    PROPERTIES TIMEOUT 60)
 endif()
 if(NOT NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "SCHANNEL")
   if(CMAKE_CONFIGURATION_TYPES)

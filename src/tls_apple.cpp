@@ -1618,6 +1618,48 @@ void EVP_PKEY_free(EVP_PKEY* pkey) {
   if (pkey->refs <= 0) delete pkey;
 }
 
+EVP_PKEY* d2i_PrivateKey_bio(BIO* bp, EVP_PKEY** a) {
+  if (!bp) return nullptr;
+  char* p = nullptr;
+  long n = BIO_get_mem_data(bp, &p);
+  if (!p || n <= 0) return nullptr;
+
+  auto pem = wrap_pem("PRIVATE KEY", reinterpret_cast<const unsigned char*>(p),
+                      static_cast<size_t>(n));
+  if (pem.empty()) return nullptr;
+
+  auto* pkey = new EVP_PKEY();
+  pkey->key = import_private_key_from_pem(pem, nullptr);
+  if (!pkey->key) {
+    delete pkey;
+    return nullptr;
+  }
+
+  pkey->has_key = true;
+  pkey->pem = std::move(pem);
+  if (a) *a = pkey;
+  return pkey;
+}
+
+int EVP_PKEY_is_a(const EVP_PKEY* pkey, const char* name) {
+  if (!pkey || !pkey->has_key || !pkey->key || !name) return 0;
+  if (std::strcmp(name, "RSA") != 0) return 0;
+
+  CFDictionaryRef attrs = SecKeyCopyAttributes(pkey->key);
+  if (!attrs) return 0;
+
+  bool is_rsa = false;
+  CFTypeRef key_type = CFDictionaryGetValue(attrs, kSecAttrKeyType);
+  if (key_type && CFGetTypeID(key_type) == CFStringGetTypeID()) {
+    is_rsa = CFStringCompare(static_cast<CFStringRef>(key_type),
+                             kSecAttrKeyTypeRSA,
+                             0) == kCFCompareEqualTo;
+  }
+
+  CFRelease(attrs);
+  return is_rsa ? 1 : 0;
+}
+
 /* ===== X509 ===== */
 int i2d_X509(const X509* x, unsigned char** out) {
   if (!x || x->der.empty()) return -1;
@@ -2072,6 +2114,28 @@ int SSL_CTX_use_certificate(SSL_CTX* ctx, X509* x) {
   return 1;
 }
 
+int SSL_CTX_use_certificate_ASN1(SSL_CTX* ctx, int len, const unsigned char* d) {
+  if (!ctx || !d || len <= 0) return 0;
+
+  auto* cert = x509_from_der(d, static_cast<size_t>(len));
+  if (!cert) return 0;
+
+  if (ctx->own_cert) X509_free(ctx->own_cert);
+  ctx->own_cert = cert;
+
+  for (auto* c : ctx->own_chain) {
+    if (c) CFRelease(c);
+  }
+  ctx->own_chain.clear();
+
+  if (ctx->identity) {
+    CFRelease(ctx->identity);
+    ctx->identity = nullptr;
+  }
+
+  return 1;
+}
+
 int SSL_CTX_use_PrivateKey(SSL_CTX* ctx, EVP_PKEY* pkey) {
   if (!ctx || !pkey || !pkey->has_key) return 0;
   if (ctx->own_key) EVP_PKEY_free(ctx->own_key);
@@ -2124,6 +2188,39 @@ int SSL_CTX_check_private_key(const SSL_CTX* ctx) {
   CFRelease(pub_from_priv);
 
   return ok ? 1 : 0;
+}
+
+int SSL_CTX_add_extra_chain_cert(SSL_CTX* ctx, X509* x509) {
+  if (!ctx) {
+    if (x509) X509_free(x509);
+    return 0;
+  }
+
+  if (x509 && x509->cert) {
+    CFRetain(x509->cert);
+    ctx->own_chain.push_back(x509->cert);
+  }
+
+  if (ctx->identity) {
+    CFRelease(ctx->identity);
+    ctx->identity = nullptr;
+  }
+
+  if (x509) X509_free(x509);
+  return 1;
+}
+
+void SSL_CTX_clear_chain_certs(SSL_CTX* ctx) {
+  if (!ctx) return;
+  for (auto* c : ctx->own_chain) {
+    if (c) CFRelease(c);
+  }
+  ctx->own_chain.clear();
+
+  if (ctx->identity) {
+    CFRelease(ctx->identity);
+    ctx->identity = nullptr;
+  }
 }
 
 void SSL_CTX_set_cert_store(SSL_CTX* ctx, X509_STORE* store) {

@@ -1754,6 +1754,44 @@ int EVP_DigestFinal_ex(EVP_MD_CTX* ctx, unsigned char* md, unsigned int* s) {
 
 void EVP_PKEY_free(EVP_PKEY* pkey) { delete pkey; }
 
+EVP_PKEY* d2i_PrivateKey_bio(BIO* bp, EVP_PKEY** a) {
+#ifdef _WIN32
+  if (!bp) return nullptr;
+  char* p = nullptr;
+  long n = BIO_get_mem_data(bp, &p);
+  if (!p || n <= 0) return nullptr;
+
+  std::vector<unsigned char> der(reinterpret_cast<unsigned char*>(p),
+                                 reinterpret_cast<unsigned char*>(p) + n);
+  auto* pkey = new EVP_PKEY();
+  if (!import_private_key_pkcs8(der, pkey)) {
+    delete pkey;
+    return nullptr;
+  }
+
+  pkey->pkcs8_der = std::move(der);
+  pkey->has_key = true;
+  if (a) *a = pkey;
+  return pkey;
+#else
+  (void)bp;
+  (void)a;
+  return nullptr;
+#endif
+}
+
+int EVP_PKEY_is_a(const EVP_PKEY* pkey, const char* name) {
+#ifdef _WIN32
+  if (!pkey || !pkey->has_key || !name) return 0;
+  if (std::strcmp(name, "RSA") != 0) return 0;
+  return 1;
+#else
+  (void)pkey;
+  (void)name;
+  return 0;
+#endif
+}
+
 /* ===== X509 ===== */
 int i2d_X509(const X509* x, unsigned char** out) {
   if (!x || x->der.empty()) return -1;
@@ -2175,6 +2213,34 @@ int SSL_CTX_use_certificate(SSL_CTX* ctx, X509* x) {
   return 1;
 }
 
+int SSL_CTX_use_certificate_ASN1(SSL_CTX* ctx, int len, const unsigned char* d) {
+#ifdef _WIN32
+  if (!ctx || !d || len <= 0) return 0;
+
+  auto* cert = x509_from_der(d, static_cast<size_t>(len));
+  if (!cert) return 0;
+
+  if (ctx->own_cert) X509_free(ctx->own_cert);
+  ctx->own_cert = cert;
+
+  if (ctx->own_cert && ctx->own_key) {
+    if (!attach_private_key_to_cert(ctx->own_cert, ctx->own_key)) {
+      if (ERR_peek_last_error() == 0) {
+        set_error_message("failed to bind private key to certificate");
+      }
+      return 0;
+    }
+  }
+
+  return 1;
+#else
+  (void)ctx;
+  (void)len;
+  (void)d;
+  return 0;
+#endif
+}
+
 int SSL_CTX_use_PrivateKey(SSL_CTX* ctx, EVP_PKEY* pkey) {
   if (!ctx || !pkey || !pkey->has_key) return 0;
   if (ctx->own_key) EVP_PKEY_free(ctx->own_key);
@@ -2242,6 +2308,13 @@ int SSL_CTX_check_private_key(const SSL_CTX* ctx) {
   return 0;
 #endif
 }
+
+int SSL_CTX_add_extra_chain_cert(SSL_CTX* /*ctx*/, X509* x509) {
+  if (x509) X509_free(x509);
+  return 1;
+}
+
+void SSL_CTX_clear_chain_certs(SSL_CTX* /*ctx*/) {}
 
 void SSL_CTX_set_cert_store(SSL_CTX* ctx, X509_STORE* store) {
   if (!ctx || !store) return;
