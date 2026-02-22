@@ -64,6 +64,7 @@
 using native_tls::clear_error_message;
 using native_tls::close_socket_fd;
 using native_tls::extract_dn_component;
+using native_tls::ip_bytes_match_host;
 using native_tls::is_ip_literal;
 using native_tls::set_error_message;
 using native_tls::set_fd_nonblocking;
@@ -233,6 +234,8 @@ struct ssl_st {
   std::string selected_alpn;
   x509_verify_param_st param;
   bool ignore_verify_result = false;
+  bool has_verify_result_override = false;
+  long verify_result_override = X509_V_OK;
 
   std::vector<unsigned char> peeked_plaintext;
 
@@ -391,6 +394,30 @@ bool ssl_should_verify_peer(const SSL* ssl) {
   if (!ssl || !ssl->ctx) return false;
   if (ssl->verify_mode & SSL_VERIFY_PEER) return true;
   return ctx_should_verify_peer(ssl->ctx);
+}
+
+bool enforce_verify_depth(SSL* ssl) {
+  if (!ssl || !ssl->ctx) return true;
+  if (!ssl_should_verify_peer(ssl)) return true;
+  int depth_limit = ssl->verify_depth ? ssl->verify_depth : ssl->ctx->verify_depth;
+  if (depth_limit <= 0) return true;
+
+  const mbedtls_x509_crt* cert = mbedtls_ssl_get_peer_cert(&ssl->ssl);
+  if (!cert || !cert->raw.p) return true;
+
+  int chain_len = 0;
+  for (auto* p = cert; p && p->raw.p; p = p->next) {
+    ++chain_len;
+  }
+  if (chain_len == 0) return true;
+
+  int chain_depth = chain_len - 1;
+  if (chain_depth <= depth_limit) return true;
+
+  ssl->verify_result_override = X509_V_ERR_CERT_CHAIN_TOO_LONG;
+  ssl->has_verify_result_override = true;
+  set_error_message("certificate chain too long", X509_V_ERR_CERT_CHAIN_TOO_LONG);
+  return false;
 }
 
 void apply_ctx_verify_mode(SSL_CTX* ctx) {
@@ -598,10 +625,7 @@ bool cert_matches_hostname(const X509* cert, const std::string& host, bool check
       if (check_ip && gn->type == GEN_IPADD && gn->d.iPAddress) {
         auto* data = ASN1_STRING_get0_data(gn->d.iPAddress);
         int len = ASN1_STRING_length(gn->d.iPAddress);
-        char buf[INET6_ADDRSTRLEN] = {0};
-        if (len == 4) inet_ntop(AF_INET, data, buf, sizeof(buf));
-        else if (len == 16) inet_ntop(AF_INET6, data, buf, sizeof(buf));
-        if (host == buf) {
+        if (ip_bytes_match_host(data, static_cast<size_t>(len), host)) {
           GENERAL_NAMES_free(names);
           return true;
         }
@@ -642,6 +666,11 @@ int run_verify_callback_if_any(SSL* ssl) {
 
   int preverify = (verify_result == X509_V_OK) ? 1 : 0;
   int rc = cb(preverify, &verify_ctx);
+
+  if (rc != 0 && preverify == 0) {
+    ssl->has_verify_result_override = false;
+    ssl->verify_result_override = X509_V_OK;
+  }
 
   if (cert) X509_free(cert);
   return rc;
@@ -707,15 +736,6 @@ extern "C" {
 #include "tls_shared_exports.inl"
 
 /* ===== BIO ===== */
-BIO* BIO_new_file(const char* filename, const char* mode) {
-  if (!filename || !mode || std::strchr(mode, 'r') == nullptr) return nullptr;
-  std::ifstream ifs(filename, std::ios::binary);
-  if (!ifs) return nullptr;
-
-  std::string bytes((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-  return BIO_new_mem_buf(bytes.data(), static_cast<int>(bytes.size()));
-}
-
 int BIO_new_bio_pair(BIO** bio1, size_t /*writebuf1*/, BIO** bio2, size_t /*writebuf2*/) {
   if (!bio1 || !bio2) return 0;
   auto* a = new BIO();
@@ -732,7 +752,8 @@ int BIO_new_bio_pair(BIO** bio1, size_t /*writebuf1*/, BIO** bio2, size_t /*writ
 int BIO_read(BIO* bio, void* data, int len) {
   if (!bio || !data || len <= 0) return -1;
 
-  if ((bio->kind == BioKind::Memory || bio->kind == BioKind::Pair) && bio_pending_bytes(bio) > 0) {
+  if (bio->kind == BioKind::Memory || bio->kind == BioKind::Pair) {
+    if (bio_pending_bytes(bio) == 0) return 0;
     int n = static_cast<int>(std::min<size_t>(static_cast<size_t>(len), bio_pending_bytes(bio)));
     std::memcpy(data, bio->data.data() + bio->offset, static_cast<size_t>(n));
     bio->offset += static_cast<size_t>(n);
@@ -1235,13 +1256,26 @@ int SSL_CTX_use_PrivateKey_file(SSL_CTX* ctx, const char* file, int /*type*/) {
   mbedtls_pk_free(&ctx->own_key);
   mbedtls_pk_init(&ctx->own_key);
 
+  std::string passwd;
+  const char* passwd_arg = ctx->passwd_userdata
+                               ? static_cast<const char*>(ctx->passwd_userdata)
+                               : nullptr;
+  if (ctx->passwd_cb) {
+    char buf[1024] = {0};
+    int n = ctx->passwd_cb(buf, static_cast<int>(sizeof(buf)), 0, ctx->passwd_userdata);
+    if (n > 0) {
+      passwd.assign(buf, buf + n);
+      passwd_arg = passwd.c_str();
+    }
+  }
+
 #if MBEDTLS_VERSION_MAJOR >= 3
   int rc = mbedtls_pk_parse_keyfile(&ctx->own_key, file,
-      ctx->passwd_userdata ? static_cast<const char*>(ctx->passwd_userdata) : nullptr,
+      passwd_arg,
       mbedtls_ctr_drbg_random, &ctx->ctr_drbg);
 #else
   int rc = mbedtls_pk_parse_keyfile(&ctx->own_key, file,
-      ctx->passwd_userdata ? static_cast<const char*>(ctx->passwd_userdata) : nullptr);
+      passwd_arg);
 #endif
   if (rc != 0) return 0;
   ctx->own_key_loaded = true;
@@ -1538,6 +1572,8 @@ int SSL_connect(SSL* ssl) {
   }
 
   ssl->ignore_verify_result = false;
+  ssl->has_verify_result_override = false;
+  ssl->verify_result_override = X509_V_OK;
 
   int ret = mbedtls_ssl_handshake(&ssl->ssl);
 
@@ -1564,9 +1600,15 @@ int SSL_connect(SSL* ssl) {
   if (ret == 0) {
     ssl->last_ret = 1;
     ssl->last_error = SSL_ERROR_NONE;
+    bool depth_ok = enforce_verify_depth(ssl);
     if (!run_verify_callback_if_any(ssl)) {
       ssl->last_error = SSL_ERROR_SSL;
       set_error_message("verify callback rejected certificate");
+      return -1;
+    }
+    if (!depth_ok && ssl->has_verify_result_override) {
+      ssl->last_ret = -1;
+      ssl->last_error = SSL_ERROR_SSL;
       return -1;
     }
     if ((effective_verify_mode & SSL_VERIFY_PEER) && !ssl->param.host.empty()) {
@@ -1594,6 +1636,8 @@ int SSL_accept(SSL* ssl) {
   if (!ssl || !ssl->ssl_setup) return -1;
 
   ssl->ignore_verify_result = false;
+  ssl->has_verify_result_override = false;
+  ssl->verify_result_override = X509_V_OK;
 
   int ret = mbedtls_ssl_handshake(&ssl->ssl);
 
@@ -1603,9 +1647,15 @@ int SSL_accept(SSL* ssl) {
   if (ret == 0) {
     ssl->last_ret = 1;
     ssl->last_error = SSL_ERROR_NONE;
+    bool depth_ok = enforce_verify_depth(ssl);
     if (!run_verify_callback_if_any(ssl)) {
       ssl->last_error = SSL_ERROR_SSL;
       set_error_message("verify callback rejected peer certificate");
+      return -1;
+    }
+    if (!depth_ok && ssl->has_verify_result_override) {
+      ssl->last_ret = -1;
+      ssl->last_error = SSL_ERROR_SSL;
       return -1;
     }
     auto* alpn = mbedtls_ssl_get_alpn_protocol(&ssl->ssl);
@@ -1691,12 +1741,23 @@ int SSL_shutdown(SSL* ssl) {
   ssl->last_error = map_mbedtls_to_ssl_error(ret);
   if (ret == 0) {
     ssl->shutdown_state |= SSL_SENT_SHUTDOWN;
-    ssl->last_ret = 1;
-    ssl->last_error = SSL_ERROR_NONE;
-    return 1;
+    if (ssl->shutdown_state & SSL_RECEIVED_SHUTDOWN) {
+      ssl->last_ret = 1;
+      ssl->last_error = SSL_ERROR_NONE;
+      return 1;
+    }
+    ssl->last_ret = 0;
+    ssl->last_error = SSL_ERROR_WANT_READ;
+    return 0;
   }
   if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+    ssl->last_ret = 0;
     return 0;
+  }
+  if (ret < 0 && ssl->last_error == SSL_ERROR_SSL) {
+    char err[256] = {0};
+    mbedtls_strerror(ret, err, sizeof(err));
+    set_error_message(std::string("SSL_shutdown failed: ") + err);
   }
   return -1;
 }
@@ -1719,6 +1780,7 @@ X509* SSL_get_peer_certificate(const SSL* ssl) {
 long SSL_get_verify_result(const SSL* ssl) {
   if (!ssl) return X509_V_ERR_UNSPECIFIED;
   if (ssl->ignore_verify_result) return X509_V_OK;
+  if (ssl->has_verify_result_override) return ssl->verify_result_override;
   uint32_t flags = mbedtls_ssl_get_verify_result(&ssl->ssl);
   if (flags == 0) return X509_V_OK;
   if (flags & MBEDTLS_X509_BADCERT_EXPIRED) return X509_V_ERR_CERT_HAS_EXPIRED;

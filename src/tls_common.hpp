@@ -3,6 +3,7 @@
 #include "openssl/err.h"
 #include "openssl/x509.h"
 
+#include <cstddef>
 #include <ctime>
 #include <string>
 #include <vector>
@@ -53,6 +54,7 @@ struct x509_verify_param_st {
 };
 
 struct ssl_st;
+struct ssl_ctx_st;
 
 struct x509_store_ctx_st {
   ssl_st* ssl = nullptr;
@@ -75,6 +77,11 @@ std::string get_last_error_string(unsigned long code);
 unsigned long make_error_code(int lib, int reason);
 void set_error_message(const std::string& msg, int reason = 1, int lib = ERR_LIB_X509);
 void clear_error_message();
+
+std::string read_file_text(const char* path);
+bool ip_bytes_match_host(const unsigned char* data, size_t len, const std::string& host);
+void clear_ssl_app_data(const ssl_st* ssl);
+void clear_ssl_ctx_app_data(const ssl_ctx_st* ctx);
 
 std::string trim(std::string s);
 std::string normalize(std::string s);

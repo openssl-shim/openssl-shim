@@ -30,6 +30,13 @@ BIO* BIO_new(const BIO_METHOD* method) {
   return BIO_new_mem_buf(nullptr, 0);
 }
 
+BIO* BIO_new_file(const char* filename, const char* mode) {
+  if (!filename || !mode || std::strchr(mode, 'r') == nullptr) return nullptr;
+  auto bytes = native_tls::read_file_text(filename);
+  if (bytes.empty()) return nullptr;
+  return BIO_new_mem_buf(bytes.data(), static_cast<int>(bytes.size()));
+}
+
 const BIO_METHOD* BIO_s_mem(void) { return &g_mem_method; }
 
 void BIO_free_all(BIO* a) { (void)BIO_free(a); }
@@ -138,7 +145,11 @@ STACK_OF_X509_OBJECT* X509_STORE_get0_objects(const X509_STORE* store) {
   return &s->object_cache;
 }
 
-void SSL_CTX_free(SSL_CTX* ctx) { delete ctx; }
+void SSL_CTX_free(SSL_CTX* ctx) {
+  if (!ctx) return;
+  native_tls::clear_ssl_ctx_app_data(ctx);
+  delete ctx;
+}
 
 void SSL_CTX_set_verify_depth(SSL_CTX* ctx, int depth) {
   if (ctx) ctx->verify_depth = depth;
@@ -182,7 +193,11 @@ void SSL_CTX_set_client_CA_list(SSL_CTX* ctx, STACK_OF_X509_NAME* list) {
   ctx->client_ca_list = list;
 }
 
-void SSL_free(SSL* ssl) { delete ssl; }
+void SSL_free(SSL* ssl) {
+  if (!ssl) return;
+  native_tls::clear_ssl_app_data(ssl);
+  delete ssl;
+}
 
 BIO* SSL_get_rbio(const SSL* ssl) { return ssl ? ssl->rbio : nullptr; }
 

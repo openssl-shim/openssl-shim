@@ -45,7 +45,9 @@
 using native_tls::clear_error_message;
 using native_tls::close_socket_fd;
 using native_tls::extract_dn_component;
+using native_tls::ip_bytes_match_host;
 using native_tls::is_ip_literal;
+using native_tls::read_file_text;
 using native_tls::set_error_message;
 using native_tls::set_fd_nonblocking;
 using native_tls::trim;
@@ -77,14 +79,6 @@ std::string cferror_to_string(OSStatus status) {
   if (out.empty()) {
     out = "OSStatus=" + std::to_string(static_cast<int>(status));
   }
-  return out;
-}
-
-std::string read_file_text(const char* path) {
-  if (!path) return {};
-  std::ifstream ifs(path, std::ios::binary);
-  if (!ifs) return {};
-  std::string out((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
   return out;
 }
 
@@ -702,10 +696,7 @@ bool cert_matches_hostname(const X509* cert, const std::string& host, bool check
       if (check_ip && gn->type == GEN_IPADD && gn->d.iPAddress) {
         auto* data = ASN1_STRING_get0_data(gn->d.iPAddress);
         int len = ASN1_STRING_length(gn->d.iPAddress);
-        char buf[INET6_ADDRSTRLEN] = {0};
-        if (len == 4) inet_ntop(AF_INET, data, buf, sizeof(buf));
-        else if (len == 16) inet_ntop(AF_INET6, data, buf, sizeof(buf));
-        if (host == buf) {
+        if (ip_bytes_match_host(data, static_cast<size_t>(len), host)) {
           GENERAL_NAMES_free(names);
           return true;
         }
@@ -1148,11 +1139,21 @@ bool evaluate_peer_trust(SSL* ssl, bool require_cert) {
   bool has_custom_anchors = ssl->ctx->cert_store && !ssl->ctx->cert_store->certs.empty();
   bool should_evaluate = verify_peer || has_custom_anchors || ssl->ctx->use_system_roots;
 
+  bool depth_error = false;
+  int depth_limit = ssl->verify_depth ? ssl->verify_depth : ssl->ctx->verify_depth;
+  if (should_evaluate && depth_limit > 0) {
+    CFIndex count = SecTrustGetCertificateCount(trust);
+    if (count > 0 && (count - 1) > depth_limit) {
+      ssl->verify_result = X509_V_ERR_CERT_CHAIN_TOO_LONG;
+      depth_error = true;
+    }
+  }
+
   SecTrustRef eval_trust = trust;
   CFArrayRef certs = nullptr;
   SecPolicyRef policy = nullptr;
 
-  if (should_evaluate) {
+  if (should_evaluate && !depth_error) {
     CFIndex count = SecTrustGetCertificateCount(trust);
     if (count > 0) {
       CFMutableArrayRef cert_array = CFArrayCreateMutable(kCFAllocatorDefault,
@@ -1182,7 +1183,7 @@ bool evaluate_peer_trust(SSL* ssl, bool require_cert) {
     }
   }
 
-  if (should_evaluate) {
+  if (should_evaluate && !depth_error) {
     if (has_custom_anchors) {
       CFMutableArrayRef anchors = CFArrayCreateMutable(kCFAllocatorDefault,
                                                        static_cast<CFIndex>(ssl->ctx->cert_store->certs.size()),
@@ -1209,7 +1210,7 @@ bool evaluate_peer_trust(SSL* ssl, bool require_cert) {
     trust_ok = SecTrustEvaluateWithError(eval_trust, nullptr);
 #endif
     ssl->verify_result = trust_ok ? X509_V_OK : map_trust_result_to_error(eval_trust);
-  } else {
+  } else if (!should_evaluate) {
     ssl->verify_result = X509_V_OK;
   }
 
@@ -1499,7 +1500,8 @@ int BIO_new_bio_pair(BIO** bio1, size_t /*writebuf1*/, BIO** bio2, size_t /*writ
 int BIO_read(BIO* bio, void* data, int len) {
   if (!bio || !data || len <= 0) return -1;
 
-  if ((bio->kind == BioKind::Memory || bio->kind == BioKind::Pair) && bio_pending_bytes(bio) > 0) {
+  if (bio->kind == BioKind::Memory || bio->kind == BioKind::Pair) {
+    if (bio_pending_bytes(bio) == 0) return 0;
     int n = static_cast<int>((std::min)(static_cast<size_t>(len), bio_pending_bytes(bio)));
     std::memcpy(data, bio->data.data() + bio->offset, static_cast<size_t>(n));
     bio->offset += static_cast<size_t>(n);
@@ -2464,9 +2466,14 @@ int SSL_shutdown(SSL* ssl) {
   OSStatus st = SSLClose(ssl->ssl);
   if (st == noErr) {
     ssl->shutdown_state |= SSL_SENT_SHUTDOWN;
-    ssl->last_ret = 1;
-    ssl->last_error = SSL_ERROR_NONE;
-    return 1;
+    if (ssl->shutdown_state & SSL_RECEIVED_SHUTDOWN) {
+      ssl->last_ret = 1;
+      ssl->last_error = SSL_ERROR_NONE;
+      return 1;
+    }
+    ssl->last_ret = 0;
+    ssl->last_error = SSL_ERROR_WANT_READ;
+    return 0;
   }
   if (st == errSSLWouldBlock) {
     ssl->last_ret = -1;

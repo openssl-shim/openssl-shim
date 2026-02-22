@@ -63,7 +63,9 @@
 using native_tls::clear_error_message;
 using native_tls::close_socket_fd;
 using native_tls::extract_dn_component;
+using native_tls::ip_bytes_match_host;
 using native_tls::is_ip_literal;
+using native_tls::read_file_text;
 using native_tls::set_error_message;
 using native_tls::set_fd_nonblocking;
 using native_tls::trim;
@@ -331,14 +333,6 @@ std::wstring utf8_to_wide(const std::string& s) {
   if (len <= 1) return {};
   std::wstring out(static_cast<size_t>(len - 1), L'\0');
   MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, out.data(), len);
-  return out;
-}
-
-std::string read_file_text(const char* path) {
-  if (!path) return {};
-  std::ifstream ifs(path, std::ios::binary);
-  if (!ifs) return {};
-  std::string out((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
   return out;
 }
 
@@ -1001,6 +995,19 @@ long verify_peer_chain(SSL* ssl, PCCERT_CONTEXT peer_cert, bool verify_peer) {
     return X509_V_ERR_UNSPECIFIED;
   }
 
+  int depth_limit = ssl->verify_depth ? ssl->verify_depth : ssl->ctx->verify_depth;
+  if (depth_limit > 0 && chain->cChain > 0 && chain->rgpChain) {
+    DWORD elements = chain->rgpChain[0] ? chain->rgpChain[0]->cElement : 0;
+    if (elements > 0) {
+      int chain_depth = static_cast<int>(elements) - 1;
+      if (chain_depth > depth_limit) {
+        CertFreeCertificateChain(chain);
+        if (free_engine) CertFreeCertificateChainEngine(engine);
+        return X509_V_ERR_CERT_CHAIN_TOO_LONG;
+      }
+    }
+  }
+
   long result = map_chain_status_to_verify_error(chain->TrustStatus.dwErrorStatus, peer_cert);
 
   if (result == X509_V_OK) {
@@ -1542,10 +1549,7 @@ bool cert_matches_hostname(const X509* cert, const std::string& host, bool check
       if (check_ip && gn->type == GEN_IPADD && gn->d.iPAddress) {
         auto* data = ASN1_STRING_get0_data(gn->d.iPAddress);
         int len = ASN1_STRING_length(gn->d.iPAddress);
-        char buf[INET6_ADDRSTRLEN] = {0};
-        if (len == 4) inet_ntop(AF_INET, data, buf, sizeof(buf));
-        else if (len == 16) inet_ntop(AF_INET6, data, buf, sizeof(buf));
-        if (host == buf) {
+        if (ip_bytes_match_host(data, static_cast<size_t>(len), host)) {
           GENERAL_NAMES_free(names);
           return true;
         }
@@ -1606,7 +1610,8 @@ int BIO_new_bio_pair(BIO** bio1, size_t /*writebuf1*/, BIO** bio2, size_t /*writ
 int BIO_read(BIO* bio, void* data, int len) {
   if (!bio || !data || len <= 0) return -1;
 
-  if ((bio->kind == BioKind::Memory || bio->kind == BioKind::Pair) && bio_pending_bytes(bio) > 0) {
+  if (bio->kind == BioKind::Memory || bio->kind == BioKind::Pair) {
+    if (bio_pending_bytes(bio) == 0) return 0;
     int n = static_cast<int>((std::min)(static_cast<size_t>(len), bio_pending_bytes(bio)));
     std::memcpy(data, bio->data.data() + bio->offset, static_cast<size_t>(n));
     bio->offset += static_cast<size_t>(n);
@@ -2120,12 +2125,23 @@ int SSL_CTX_use_PrivateKey_file(SSL_CTX* ctx, const char* file, int /*type*/) {
   auto pem = read_file_text(file);
   if (pem.empty()) return 0;
 
+  std::string passwd;
+  void* passwd_arg = ctx->passwd_userdata;
+  if (ctx->passwd_cb) {
+    char buf[1024] = {0};
+    int n = ctx->passwd_cb(buf, static_cast<int>(sizeof(buf)), 0, ctx->passwd_userdata);
+    if (n > 0) {
+      passwd.assign(buf, buf + n);
+      passwd_arg = const_cast<char*>(passwd.c_str());
+    }
+  }
+
   auto* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
   if (!bio) return 0;
   auto* pkey = PEM_read_bio_PrivateKey(bio,
                                        nullptr,
-                                       nullptr,
-                                       ctx->passwd_userdata);
+                                       ctx->passwd_cb,
+                                       passwd_arg);
   BIO_free(bio);
   if (!pkey) return 0;
 
@@ -2593,9 +2609,15 @@ int SSL_shutdown(SSL* ssl) {
     ssl->shutdown_state |= SSL_SENT_SHUTDOWN;
   }
 
-  ssl->last_ret = 1;
-  ssl->last_error = SSL_ERROR_NONE;
-  return 1;
+  if (ssl->shutdown_state & SSL_RECEIVED_SHUTDOWN) {
+    ssl->last_ret = 1;
+    ssl->last_error = SSL_ERROR_NONE;
+    return 1;
+  }
+
+  ssl->last_ret = 0;
+  ssl->last_error = SSL_ERROR_WANT_READ;
+  return 0;
 #else
   (void)ssl;
   return 1;

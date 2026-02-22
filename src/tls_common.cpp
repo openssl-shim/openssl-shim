@@ -11,6 +11,7 @@
 #include <array>
 #include <cctype>
 #include <cstring>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -84,6 +85,38 @@ void set_error_message(const std::string& msg, int reason, int lib) {
 }
 
 void clear_error_message() { set_last_error(0, {}); }
+
+std::string read_file_text(const char* path) {
+  if (!path) return {};
+  std::ifstream ifs(path, std::ios::binary);
+  if (!ifs) return {};
+  return std::string((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+}
+
+bool ip_bytes_match_host(const unsigned char* data, size_t len, const std::string& host) {
+  if (!data || host.empty()) return false;
+
+  std::array<unsigned char, 16> buf{};
+  if (inet_pton(AF_INET, host.c_str(), buf.data()) == 1) {
+    return len == 4 && std::memcmp(data, buf.data(), 4) == 0;
+  }
+  if (inet_pton(AF_INET6, host.c_str(), buf.data()) == 1) {
+    return len == 16 && std::memcmp(data, buf.data(), 16) == 0;
+  }
+  return false;
+}
+
+void clear_ssl_app_data(const ssl_st* ssl) {
+  if (!ssl) return;
+  std::lock_guard<std::mutex> lock(g_app_data_mutex);
+  g_ssl_app_data.erase(reinterpret_cast<const SSL*>(ssl));
+}
+
+void clear_ssl_ctx_app_data(const ssl_ctx_st* ctx) {
+  if (!ctx) return;
+  std::lock_guard<std::mutex> lock(g_app_data_mutex);
+  g_ssl_ctx_app_data.erase(reinterpret_cast<const SSL_CTX*>(ctx));
+}
 
 std::string trim(std::string s) {
   while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front())))
@@ -433,6 +466,7 @@ const char* X509_verify_cert_error_string(long n) {
     case X509_V_ERR_CERT_HAS_EXPIRED: return "certificate has expired";
     case X509_V_ERR_CERT_NOT_YET_VALID: return "certificate is not yet valid";
     case X509_V_ERR_CERT_REVOKED: return "certificate revoked";
+    case X509_V_ERR_CERT_CHAIN_TOO_LONG: return "certificate chain too long";
     case X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT: return "self signed certificate";
     case X509_V_ERR_HOSTNAME_MISMATCH: return "hostname mismatch";
     default: return "certificate verify error";
