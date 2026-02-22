@@ -93,6 +93,10 @@ add_executable(test_httplib_spoofed_ca test_httplib_spoofed_ca.cpp)
 target_compile_definitions(test_httplib_spoofed_ca PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT NTS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(test_httplib_spoofed_ca PRIVATE httplib::httplib OpenSSL::SSL OpenSSL::Crypto)
 
+add_executable(test_httplib_chain_file test_httplib_chain_file.cpp)
+target_compile_definitions(test_httplib_chain_file PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT NTS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_link_libraries(test_httplib_chain_file PRIVATE httplib::httplib OpenSSL::SSL OpenSSL::Crypto)
+
 add_executable(test_wildcard_host_validation test_wildcard_host_validation.cpp)
 target_compile_definitions(test_wildcard_host_validation PRIVATE NTS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(test_wildcard_host_validation PRIVATE OpenSSL::SSL OpenSSL::Crypto)
@@ -155,6 +159,7 @@ add_test(NAME test_httplib_hostname_mismatch COMMAND test_httplib_hostname_misma
 add_test(NAME test_httplib_in_memory_ca COMMAND test_httplib_in_memory_ca)
 add_test(NAME test_httplib_mtls COMMAND test_httplib_mtls)
 add_test(NAME test_httplib_spoofed_ca COMMAND test_httplib_spoofed_ca)
+add_test(NAME test_httplib_chain_file COMMAND test_httplib_chain_file)
 add_test(NAME test_wildcard_host_validation COMMAND test_wildcard_host_validation)
 add_test(NAME test_cipher_list_validation COMMAND test_cipher_list_validation)
 add_test(NAME test_private_key_mismatch COMMAND test_private_key_mismatch)
