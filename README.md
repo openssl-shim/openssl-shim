@@ -168,7 +168,7 @@ Current test set covers:
 - IX Http TLS matrix (trusted/untrusted/hostname/in-memory-CA)
 - IXWebSocket mTLS (client cert required)
 - TLS 1.3-only interop runner (all non-Schannel backends)
-- standalone Asio HTTPS roundtrip runner (mbedTLS and Schannel backends)
+- standalone Asio HTTPS roundtrip runner
 
 ## Cipher suites
 

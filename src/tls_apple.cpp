@@ -21,6 +21,7 @@
 #include <cassert>
 #include <cctype>
 #include <cerrno>
+#include <climits>
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
@@ -232,7 +233,7 @@ struct bio_method_st {
   int kind;
 };
 
-enum class BioKind { Socket, Memory };
+enum class BioKind { Socket, Memory, Pair };
 
 struct bio_st {
   BioKind kind = BioKind::Memory;
@@ -240,6 +241,7 @@ struct bio_st {
   bool close_on_free = false;
   std::vector<unsigned char> data;
   size_t offset = 0;
+  BIO* pair = nullptr;
 };
 
 enum class DigestKind { Md5, Sha256, Sha512 };
@@ -280,7 +282,9 @@ struct ssl_ctx_st {
   long options = 0;
   int session_cache_mode = SSL_SESS_CACHE_OFF;
   int min_proto_version = TLS1_2_VERSION;
+  int max_proto_version = TLS1_3_VERSION;
 
+  pem_password_cb* passwd_cb = nullptr;
   void* passwd_userdata = nullptr;
 
   X509_STORE* cert_store = nullptr;
@@ -331,7 +335,11 @@ struct ssl_st {
   BIO* wbio = nullptr;
 
   int verify_mode = SSL_VERIFY_NONE;
+  int verify_depth = 0;
   int (*verify_callback)(int, X509_STORE_CTX*) = nullptr;
+
+  long mode = 0;
+  int shutdown_state = 0;
 
   int last_error = SSL_ERROR_NONE;
   int last_ret = 1;
@@ -630,6 +638,25 @@ bool next_pem_block(BIO* bio, const char* begin_tag, const char* end_tag,
   return true;
 }
 
+size_t bio_pending_bytes(const BIO* bio) {
+  if (!bio || bio->offset >= bio->data.size()) return 0;
+  return bio->data.size() - bio->offset;
+}
+
+void bio_compact(BIO* bio) {
+  if (!bio || bio->offset == 0) return;
+  if (bio->offset >= bio->data.size()) {
+    bio->data.clear();
+    bio->offset = 0;
+    return;
+  }
+
+  if (bio->offset > 4096) {
+    bio->data.erase(bio->data.begin(), bio->data.begin() + static_cast<std::ptrdiff_t>(bio->offset));
+    bio->offset = 0;
+  }
+}
+
 bool load_ca_file_into_store(X509_STORE* store, const char* file) {
   if (!store || !file || !*file) return false;
   auto pem = read_file_text(file);
@@ -703,58 +730,125 @@ bool cert_matches_hostname(const X509* cert, const std::string& host, bool check
   return false;
 }
 
+bool is_socket_would_block() {
+  return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS;
+}
+
+bool has_ssl_transport(const SSL* ssl) {
+  if (!ssl) return false;
+  if (ssl->rbio || ssl->wbio) return true;
+  return ssl->fd >= 0;
+}
+
+bool uses_socket_transport(const SSL* ssl) {
+  if (!ssl) return false;
+  if (ssl->rbio && ssl->rbio->kind == BioKind::Socket) return true;
+  if (ssl->wbio && ssl->wbio->kind == BioKind::Socket) return true;
+  return ssl->fd >= 0;
+}
+
+bool uses_blocking_transport(const SSL* ssl) {
+  return ssl && uses_socket_transport(ssl) && ssl->fd >= 0 && !is_fd_nonblocking(ssl->fd);
+}
+
 OSStatus ssl_read_cb(SSLConnectionRef connection, void* data, size_t* len) {
   auto* ssl = reinterpret_cast<SSL*>(const_cast<void*>(connection));
   if (!ssl || !data || !len) return errSSLInternal;
-  if (ssl->fd < 0) return errSSLInternal;
   if (*len == 0) return noErr;
 
-  size_t requested = *len;
-  ssize_t rc = recv(ssl->fd, data, requested, 0);
+  int rc = -1;
+  bool socket_transport = false;
+  int requested = static_cast<int>((std::min)(*len, static_cast<size_t>(INT_MAX)));
+
+  if (ssl->rbio) {
+    socket_transport = ssl->rbio->kind == BioKind::Socket;
+    rc = BIO_read(ssl->rbio, data, requested);
+  } else if (ssl->fd >= 0) {
+    socket_transport = true;
+    rc = static_cast<int>(recv(ssl->fd, data, static_cast<size_t>(requested), 0));
+  } else {
+    ssl->io_want = SSL_ERROR_SYSCALL;
+    return errSSLInternal;
+  }
+
   if (rc > 0) {
     *len = static_cast<size_t>(rc);
-    if (static_cast<size_t>(rc) < requested) {
+    if (rc < requested) {
       ssl->io_want = SSL_ERROR_WANT_READ;
       return errSSLWouldBlock;
     }
     return noErr;
   }
+
   *len = 0;
-  if (rc == 0) return errSSLClosedGraceful;
-  if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS) {
+  if (rc == 0) {
+    if (socket_transport) return errSSLClosedGraceful;
     ssl->io_want = SSL_ERROR_WANT_READ;
     return errSSLWouldBlock;
   }
-  if (errno == ECONNRESET) return errSSLClosedAbort;
-  ssl->io_want = SSL_ERROR_SYSCALL;
-  return errSecIO;
+
+  if (socket_transport) {
+    if (is_socket_would_block()) {
+      ssl->io_want = SSL_ERROR_WANT_READ;
+      return errSSLWouldBlock;
+    }
+    if (errno == ECONNRESET) return errSSLClosedAbort;
+    ssl->io_want = SSL_ERROR_SYSCALL;
+    return errSecIO;
+  }
+
+  ssl->io_want = SSL_ERROR_WANT_READ;
+  return errSSLWouldBlock;
 }
 
 OSStatus ssl_write_cb(SSLConnectionRef connection, const void* data, size_t* len) {
   auto* ssl = reinterpret_cast<SSL*>(const_cast<void*>(connection));
   if (!ssl || !data || !len) return errSSLInternal;
-  if (ssl->fd < 0) return errSSLInternal;
   if (*len == 0) return noErr;
 
-  size_t requested = *len;
-  ssize_t rc = send(ssl->fd, data, requested, 0);
+  int rc = -1;
+  bool socket_transport = false;
+  int requested = static_cast<int>((std::min)(*len, static_cast<size_t>(INT_MAX)));
+
+  if (ssl->wbio) {
+    socket_transport = ssl->wbio->kind == BioKind::Socket;
+    rc = BIO_write(ssl->wbio, data, requested);
+  } else if (ssl->fd >= 0) {
+    socket_transport = true;
+    rc = static_cast<int>(send(ssl->fd, data, static_cast<size_t>(requested), 0));
+  } else {
+    ssl->io_want = SSL_ERROR_SYSCALL;
+    return errSSLInternal;
+  }
+
   if (rc > 0) {
     *len = static_cast<size_t>(rc);
-    if (static_cast<size_t>(rc) < requested) {
+    if (rc < requested) {
       ssl->io_want = SSL_ERROR_WANT_WRITE;
       return errSSLWouldBlock;
     }
     return noErr;
   }
+
   *len = 0;
-  if (rc == 0) return errSSLClosedGraceful;
-  if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS) {
+  if (rc == 0) {
+    if (socket_transport) return errSSLClosedGraceful;
     ssl->io_want = SSL_ERROR_WANT_WRITE;
     return errSSLWouldBlock;
   }
-  if (errno == ECONNRESET) return errSSLClosedAbort;
-  ssl->io_want = SSL_ERROR_SYSCALL;
-  return errSecIO;
+
+  if (socket_transport) {
+    if (is_socket_would_block()) {
+      ssl->io_want = SSL_ERROR_WANT_WRITE;
+      return errSSLWouldBlock;
+    }
+    if (errno == ECONNRESET) return errSSLClosedAbort;
+    ssl->io_want = SSL_ERROR_SYSCALL;
+    return errSecIO;
+  }
+
+  ssl->io_want = SSL_ERROR_WANT_WRITE;
+  return errSSLWouldBlock;
 }
 
 SSLProtocol protocol_from_version(int version) {
@@ -847,10 +941,12 @@ bool configure_ssl_instance(SSL* ssl) {
     set_error_message("SSLSetProtocolVersionMin failed: " + cferror_to_string(st));
     return false;
   }
-  SSLProtocol max_proto = kTLSProtocol12;
-#ifdef kTLSProtocol13
-  max_proto = kTLSProtocol13;
-#endif
+  int max_version = ssl->ctx->max_proto_version;
+  if (max_version == 0) max_version = TLS1_3_VERSION;
+  if (ssl->ctx->min_proto_version > max_version) {
+    max_version = ssl->ctx->min_proto_version;
+  }
+  SSLProtocol max_proto = protocol_from_version(max_version);
   st = SSLSetProtocolVersionMax(ssl->ssl, max_proto);
   if (st != noErr) {
     set_error_message("SSLSetProtocolVersionMax failed: " + cferror_to_string(st));
@@ -1387,6 +1483,65 @@ extern "C" {
 #include "tls_shared_exports.inl"
 
 /* ===== BIO ===== */
+int BIO_new_bio_pair(BIO** bio1, size_t /*writebuf1*/, BIO** bio2, size_t /*writebuf2*/) {
+  if (!bio1 || !bio2) return 0;
+  auto* a = new BIO();
+  auto* b = new BIO();
+  a->kind = BioKind::Pair;
+  b->kind = BioKind::Pair;
+  a->pair = b;
+  b->pair = a;
+  *bio1 = a;
+  *bio2 = b;
+  return 1;
+}
+
+int BIO_read(BIO* bio, void* data, int len) {
+  if (!bio || !data || len <= 0) return -1;
+
+  if ((bio->kind == BioKind::Memory || bio->kind == BioKind::Pair) && bio_pending_bytes(bio) > 0) {
+    int n = static_cast<int>((std::min)(static_cast<size_t>(len), bio_pending_bytes(bio)));
+    std::memcpy(data, bio->data.data() + bio->offset, static_cast<size_t>(n));
+    bio->offset += static_cast<size_t>(n);
+    bio_compact(bio);
+    return n;
+  }
+
+  if (bio->kind == BioKind::Socket && bio->fd >= 0) {
+    return static_cast<int>(recv(bio->fd, data, static_cast<size_t>(len), 0));
+  }
+
+  return -1;
+}
+
+int BIO_write(BIO* bio, const void* data, int len) {
+  if (!bio || !data || len <= 0) return -1;
+
+  if (bio->kind == BioKind::Pair) {
+    if (!bio->pair) return -1;
+    auto* dst = bio->pair;
+    dst->data.insert(dst->data.end(), static_cast<const unsigned char*>(data),
+                     static_cast<const unsigned char*>(data) + len);
+    return len;
+  }
+
+  if (bio->kind == BioKind::Memory) {
+    bio->data.insert(bio->data.end(), static_cast<const unsigned char*>(data),
+                     static_cast<const unsigned char*>(data) + len);
+    return len;
+  }
+
+  if (bio->kind == BioKind::Socket && bio->fd >= 0) {
+    return static_cast<int>(send(bio->fd, data, static_cast<size_t>(len), 0));
+  }
+
+  return -1;
+}
+
+size_t BIO_ctrl_pending(BIO* bio) { return bio_pending_bytes(bio); }
+
+size_t BIO_wpending(BIO* bio) { return bio_pending_bytes(bio); }
+
 long BIO_get_mem_data(BIO* bio, char** pp) {
   if (!bio || bio->kind != BioKind::Memory) {
     if (pp) *pp = nullptr;
@@ -1395,13 +1550,16 @@ long BIO_get_mem_data(BIO* bio, char** pp) {
   if (pp) {
     *pp = reinterpret_cast<char*>(bio->data.data() + bio->offset);
   }
-  return static_cast<long>(bio->data.size() - bio->offset);
+  return static_cast<long>(bio_pending_bytes(bio));
 }
 
 int BIO_free(BIO* a) {
   if (!a) return 0;
   if (a->kind == BioKind::Socket && a->close_on_free && a->fd >= 0) {
     close_socket_fd(a->fd);
+  }
+  if (a->kind == BioKind::Pair && a->pair) {
+    a->pair->pair = nullptr;
   }
   delete a;
   return 1;
@@ -1623,6 +1781,10 @@ int PEM_write_bio_PrivateKey(BIO* bp, EVP_PKEY* x, const void* /*enc*/, unsigned
 }
 
 /* ===== SSL methods/context ===== */
+const SSL_METHOD* TLS_method(void) { return TLS_client_method(); }
+
+const SSL_METHOD* SSLv23_method(void) { return TLS_method(); }
+
 SSL_CTX* SSL_CTX_new(const SSL_METHOD* method) {
   auto* ctx = new SSL_CTX();
   ctx->is_client = !(method && method->endpoint == 1);
@@ -1636,6 +1798,20 @@ void SSL_CTX_set_verify(SSL_CTX* ctx, int mode,
   if (!ctx) return;
   ctx->verify_mode = mode;
   ctx->verify_callback = verify_callback;
+}
+
+int SSL_CTX_get_verify_mode(const SSL_CTX* ctx) {
+  return ctx ? ctx->verify_mode : SSL_VERIFY_NONE;
+}
+
+int (*SSL_CTX_get_verify_callback(const SSL_CTX* ctx))(int, X509_STORE_CTX*) {
+  return ctx ? ctx->verify_callback : nullptr;
+}
+
+long SSL_CTX_clear_options(SSL_CTX* ctx, long options) {
+  if (!ctx) return 0;
+  ctx->options &= ~options;
+  return ctx->options;
 }
 
 static bool add_cipher_from_token(const std::string& token,
@@ -1852,9 +2028,21 @@ int SSL_CTX_use_PrivateKey_file(SSL_CTX* ctx, const char* file, int /*type*/) {
   if (!ctx || !file) return 0;
   auto pem = read_file_text(file);
   if (pem.empty()) return 0;
+
+  std::string passwd;
+  void* passwd_arg = ctx->passwd_userdata;
+  if (ctx->passwd_cb) {
+    char buf[1024] = {0};
+    int n = ctx->passwd_cb(buf, static_cast<int>(sizeof(buf)), 0, ctx->passwd_userdata);
+    if (n > 0) {
+      passwd.assign(buf, buf + n);
+      passwd_arg = const_cast<char*>(passwd.c_str());
+    }
+  }
+
   auto* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
   if (!bio) return 0;
-  auto* pkey = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, ctx->passwd_userdata);
+  auto* pkey = PEM_read_bio_PrivateKey(bio, nullptr, ctx->passwd_cb, passwd_arg);
   BIO_free(bio);
   if (!pkey) return 0;
   if (ctx->own_key) EVP_PKEY_free(ctx->own_key);
@@ -1943,9 +2131,27 @@ void SSL_CTX_set_cert_store(SSL_CTX* ctx, X509_STORE* store) {
   ctx->cert_store = store;
 }
 
+void SSL_CTX_set_default_passwd_cb(SSL_CTX* ctx, pem_password_cb* cb) {
+  if (ctx) ctx->passwd_cb = cb;
+}
+
+pem_password_cb* SSL_CTX_get_default_passwd_cb(SSL_CTX* ctx) {
+  return ctx ? ctx->passwd_cb : nullptr;
+}
+
+void* SSL_CTX_get_default_passwd_cb_userdata(SSL_CTX* ctx) {
+  return ctx ? ctx->passwd_userdata : nullptr;
+}
+
 int SSL_CTX_set_min_proto_version(SSL_CTX* ctx, int version) {
   if (!ctx) return 0;
   ctx->min_proto_version = version;
+  return 1;
+}
+
+int SSL_CTX_set_max_proto_version(SSL_CTX* ctx, int version) {
+  if (!ctx) return 0;
+  ctx->max_proto_version = version;
   return 1;
 }
 
@@ -1970,7 +2176,9 @@ SSL* SSL_new(SSL_CTX* ctx) {
   auto* ssl = new SSL();
   ssl->ctx = ctx;
   ssl->verify_mode = ctx->verify_mode;
+  ssl->verify_depth = ctx->verify_depth;
   ssl->verify_callback = ctx->verify_callback;
+  ssl->mode = ctx->mode;
   if (!configure_ssl_instance(ssl)) {
     delete ssl;
     return nullptr;
@@ -1994,10 +2202,12 @@ void SSL_set_bio(SSL* ssl, BIO* rbio, BIO* wbio) {
     }
   }
   ssl->rbio = rbio;
-  ssl->wbio = wbio;
+  ssl->wbio = wbio ? wbio : rbio;
 
-  if (rbio && rbio->kind == BioKind::Socket) {
-    ssl->fd = rbio->fd;
+  if (ssl->rbio && ssl->rbio->kind == BioKind::Socket) {
+    ssl->fd = ssl->rbio->fd;
+  } else {
+    ssl->fd = -1;
   }
 }
 
@@ -2042,32 +2252,38 @@ void SSL_set_verify(SSL* ssl, int mode,
   }
 }
 
+int SSL_get_verify_mode(const SSL* ssl) {
+  return ssl ? ssl->verify_mode : SSL_VERIFY_NONE;
+}
+
+int (*SSL_get_verify_callback(const SSL* ssl))(int, X509_STORE_CTX*) {
+  return ssl ? ssl->verify_callback : nullptr;
+}
+
+void SSL_set_verify_depth(SSL* ssl, int depth) {
+  if (ssl) ssl->verify_depth = depth;
+}
+
+long SSL_set_mode(SSL* ssl, long mode) {
+  if (!ssl) return 0;
+  ssl->mode |= mode;
+  return ssl->mode;
+}
+
+SSL_CTX* SSL_get_SSL_CTX(const SSL* ssl) {
+  return ssl ? ssl->ctx : nullptr;
+}
+
 static int ssl_do_handshake(SSL* ssl) {
   if (!ssl || !ssl->ssl_setup) return -1;
+  if (!has_ssl_transport(ssl)) {
+    ssl->last_error = SSL_ERROR_SYSCALL;
+    ssl->last_ret = -1;
+    set_error_message("SSL handshake with no transport");
+    return -1;
+  }
 
-  struct NonBlockingGuard {
-    int fd = -1;
-    bool restore = false;
-    bool was_nonblocking = false;
-    explicit NonBlockingGuard(int fd_in) : fd(fd_in) {
-      if (fd < 0) return;
-      int flags = fcntl(fd, F_GETFL, 0);
-      if (flags >= 0 && (flags & O_NONBLOCK)) {
-        was_nonblocking = true;
-        if (fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) == 0) {
-          restore = true;
-        }
-      }
-    }
-    ~NonBlockingGuard() {
-      if (!restore || fd < 0) return;
-      int flags = fcntl(fd, F_GETFL, 0);
-      if (flags >= 0) {
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-      }
-    }
-  } nonblocking_guard(ssl->fd);
-
+  bool blocking = uses_blocking_transport(ssl);
   auto effective_verify_mode = ssl->verify_mode ? ssl->verify_mode : ssl->ctx->verify_mode;
   bool require_cert = !ssl->ctx->is_client && (effective_verify_mode & SSL_VERIFY_FAIL_IF_NO_PEER_CERT);
 
@@ -2084,7 +2300,7 @@ static int ssl_do_handshake(SSL* ssl) {
     }
 
     if (st == errSSLWouldBlock) {
-      if (!nonblocking_guard.was_nonblocking) {
+      if (blocking) {
         continue;
       }
       ssl->last_error = ssl->io_want ? ssl->io_want : SSL_ERROR_WANT_READ;
@@ -2098,6 +2314,7 @@ static int ssl_do_handshake(SSL* ssl) {
     }
 
     if (st == errSSLClosedGraceful || st == errSSLClosedAbort || st == errSSLClosedNoNotify) {
+      ssl->shutdown_state |= SSL_RECEIVED_SHUTDOWN;
       ssl->last_error = SSL_ERROR_ZERO_RETURN;
       ssl->last_ret = 0;
       return 0;
@@ -2127,7 +2344,7 @@ int SSL_read(SSL* ssl, void* buf, int num) {
     return n;
   }
 
-  bool blocking = ssl->fd >= 0 && !is_fd_nonblocking(ssl->fd);
+  bool blocking = uses_blocking_transport(ssl);
   for (;;) {
     ssl->io_want = SSL_ERROR_NONE;
     size_t processed = 0;
@@ -2146,6 +2363,7 @@ int SSL_read(SSL* ssl, void* buf, int num) {
       return -1;
     }
     if (st == errSSLClosedGraceful || st == errSSLClosedAbort || st == errSSLClosedNoNotify) {
+      ssl->shutdown_state |= SSL_RECEIVED_SHUTDOWN;
       ssl->last_ret = 0;
       ssl->last_error = SSL_ERROR_ZERO_RETURN;
       return 0;
@@ -2161,7 +2379,7 @@ int SSL_read(SSL* ssl, void* buf, int num) {
 int SSL_write(SSL* ssl, const void* buf, int num) {
   if (!ssl || !buf || num <= 0) return -1;
 
-  bool blocking = ssl->fd >= 0 && !is_fd_nonblocking(ssl->fd);
+  bool blocking = uses_blocking_transport(ssl);
   for (;;) {
     ssl->io_want = SSL_ERROR_NONE;
     size_t processed = 0;
@@ -2180,6 +2398,7 @@ int SSL_write(SSL* ssl, const void* buf, int num) {
       return -1;
     }
     if (st == errSSLClosedGraceful || st == errSSLClosedAbort || st == errSSLClosedNoNotify) {
+      ssl->shutdown_state |= SSL_RECEIVED_SHUTDOWN;
       ssl->last_ret = 0;
       ssl->last_error = SSL_ERROR_ZERO_RETURN;
       return 0;
@@ -2197,7 +2416,7 @@ int SSL_peek(SSL* ssl, void* buf, int num) {
 
   if (ssl->peeked_plaintext.empty()) {
     std::vector<unsigned char> tmp(static_cast<size_t>(num));
-    bool blocking = ssl->fd >= 0 && !is_fd_nonblocking(ssl->fd);
+    bool blocking = uses_blocking_transport(ssl);
     for (;;) {
       ssl->io_want = SSL_ERROR_NONE;
       size_t processed = 0;
@@ -2213,6 +2432,7 @@ int SSL_peek(SSL* ssl, void* buf, int num) {
         ssl->last_error = ssl->io_want ? ssl->io_want : SSL_ERROR_WANT_READ;
         return -1;
       } else if (st == errSSLClosedGraceful || st == errSSLClosedAbort || st == errSSLClosedNoNotify) {
+        ssl->shutdown_state |= SSL_RECEIVED_SHUTDOWN;
         ssl->last_ret = 0;
         ssl->last_error = SSL_ERROR_ZERO_RETURN;
         return 0;
@@ -2242,10 +2462,38 @@ int SSL_pending(const SSL* ssl) {
 int SSL_shutdown(SSL* ssl) {
   if (!ssl || !ssl->ssl) return 0;
   OSStatus st = SSLClose(ssl->ssl);
-  ssl->last_ret = (st == noErr) ? 1 : -1;
-  ssl->last_error = (st == noErr) ? SSL_ERROR_NONE : SSL_ERROR_SSL;
-  if (st != noErr) set_error_message("SSLClose failed: " + cferror_to_string(st));
-  return st == noErr ? 1 : 0;
+  if (st == noErr) {
+    ssl->shutdown_state |= SSL_SENT_SHUTDOWN;
+    ssl->last_ret = 1;
+    ssl->last_error = SSL_ERROR_NONE;
+    return 1;
+  }
+  if (st == errSSLWouldBlock) {
+    ssl->last_ret = -1;
+    ssl->last_error = ssl->io_want ? ssl->io_want : SSL_ERROR_WANT_WRITE;
+    return 0;
+  }
+  if (st == errSSLClosedGraceful || st == errSSLClosedAbort || st == errSSLClosedNoNotify) {
+    ssl->shutdown_state |= (SSL_SENT_SHUTDOWN | SSL_RECEIVED_SHUTDOWN);
+    ssl->last_ret = 1;
+    ssl->last_error = SSL_ERROR_NONE;
+    return 1;
+  }
+
+  ssl->last_ret = -1;
+  ssl->last_error = SSL_ERROR_SSL;
+  set_error_message("SSLClose failed: " + cferror_to_string(st));
+  return -1;
+}
+
+int SSL_get_shutdown(const SSL* ssl) {
+  if (!ssl) return 0;
+  int state = ssl->shutdown_state;
+  if ((state & SSL_RECEIVED_SHUTDOWN) == 0 && ssl->handshake_done && ssl->fd < 0 && ssl->rbio &&
+      ssl->rbio->kind == BioKind::Pair && bio_pending_bytes(ssl->rbio) == 0) {
+    state |= SSL_RECEIVED_SHUTDOWN;
+  }
+  return state;
 }
 
 X509* SSL_get_peer_certificate(const SSL* ssl) {
@@ -2275,8 +2523,8 @@ const char* SSL_get_servername(const SSL* ssl, const int type) {
 }
 
 void SSL_clear_mode(SSL* ssl, long mode) {
-  if (!ssl || !ssl->ctx) return;
-  ssl->ctx->mode &= ~mode;
+  if (!ssl) return;
+  ssl->mode &= ~mode;
 }
 
 STACK_OF_X509_NAME* SSL_load_client_CA_file(const char* file) {

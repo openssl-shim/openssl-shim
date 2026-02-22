@@ -130,13 +130,7 @@ add_executable(test_tls13_only_client test_tls13_only_client.cpp)
 target_compile_definitions(test_tls13_only_client PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT NTS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(test_tls13_only_client PRIVATE httplib::httplib OpenSSL::SSL OpenSSL::Crypto)
 
-set(_asio_https_supported_backend FALSE)
-if(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "MBEDTLS" OR
-   NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "SCHANNEL")
-  set(_asio_https_supported_backend TRUE)
-endif()
-
-if(_asio_https_supported_backend AND EXISTS "${_asio_include_dir}/asio.hpp")
+if(EXISTS "${_asio_include_dir}/asio.hpp")
   add_executable(test_asio_https_server test_asio_https_server.cpp)
   target_include_directories(test_asio_https_server PRIVATE "${_asio_include_dir}")
   target_compile_definitions(test_asio_https_server PRIVATE ASIO_STANDALONE)
@@ -170,7 +164,7 @@ add_test(NAME test_ixwebsocket_server COMMAND test_ixwebsocket_server)
 add_test(NAME test_ixwebsocket_verify_disabled COMMAND test_ixwebsocket_verify_disabled)
 add_test(NAME test_ixhttp_tls_matrix COMMAND test_ixhttp_tls_matrix)
 add_test(NAME test_ixwebsocket_mtls COMMAND test_ixwebsocket_mtls)
-if(_asio_https_supported_backend AND EXISTS "${_asio_include_dir}/asio.hpp")
+if(EXISTS "${_asio_include_dir}/asio.hpp")
   add_test(NAME test_asio_https_roundtrip
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/run_asio_https_roundtrip.py
       --source-dir ${CMAKE_SOURCE_DIR}
