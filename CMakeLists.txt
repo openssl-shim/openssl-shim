@@ -115,7 +115,7 @@ elseif(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "SCHANNEL")
   target_sources(native_tls_shim PRIVATE src/tls_schannel.cpp)
   target_compile_definitions(native_tls_shim PUBLIC NATIVE_TLS_SHIM_BACKEND_SCHANNEL)
   if(WIN32)
-    target_link_libraries(native_tls_shim PRIVATE secur32 ncrypt crypt32 bcrypt)
+    target_link_libraries(native_tls_shim PRIVATE secur32 ncrypt crypt32 bcrypt advapi32)
   endif()
 
 elseif(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "APPLE")

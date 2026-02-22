@@ -129,7 +129,7 @@ struct bio_method_st {
   int kind;
 };
 
-enum class BioKind { Socket, Memory };
+enum class BioKind { Socket, Memory, Pair };
 
 struct bio_st {
   BioKind kind = BioKind::Memory;
@@ -137,6 +137,7 @@ struct bio_st {
   bool close_on_free = false;
   std::vector<unsigned char> data;
   size_t offset = 0;
+  BIO* pair = nullptr;
 };
 
 struct evp_pkey_st {
@@ -203,7 +204,9 @@ struct ssl_ctx_st {
   long options = 0;
   int session_cache_mode = SSL_SESS_CACHE_OFF;
   int min_proto_version = TLS1_2_VERSION;
+  int max_proto_version = TLS1_3_VERSION;
 
+  pem_password_cb* passwd_cb = nullptr;
   void* passwd_userdata = nullptr;
 
   X509_STORE* cert_store = nullptr;
@@ -233,7 +236,11 @@ struct ssl_st {
   BIO* wbio = nullptr;
 
   int verify_mode = SSL_VERIFY_NONE;
+  int verify_depth = 0;
   int (*verify_callback)(int, X509_STORE_CTX*) = nullptr;
+
+  long mode = 0;
+  int shutdown_state = 0;
 
   int last_error = SSL_ERROR_NONE;
   int last_ret = 1;
@@ -655,30 +662,61 @@ bool is_socket_would_block() {
   return err == WSAEWOULDBLOCK;
 }
 
+bool has_ssl_transport(const SSL* ssl) {
+  if (!ssl) return false;
+  if (ssl->rbio || ssl->wbio) return true;
+  return ssl->fd >= 0;
+}
+
 bool flush_pending_send(SSL* ssl) {
   if (!ssl) return false;
   while (ssl->pending_send_offset < ssl->pending_send.size()) {
     int to_send = static_cast<int>(ssl->pending_send.size() - ssl->pending_send_offset);
-    int rc = send(ssl->fd,
-                  reinterpret_cast<const char*>(ssl->pending_send.data() + ssl->pending_send_offset),
-                  to_send,
-                  0);
+    int rc = -1;
+    bool socket_transport = false;
+
+    if (ssl->wbio) {
+      socket_transport = ssl->wbio->kind == BioKind::Socket;
+      rc = BIO_write(ssl->wbio,
+                     ssl->pending_send.data() + ssl->pending_send_offset,
+                     to_send);
+    } else if (ssl->fd >= 0) {
+      socket_transport = true;
+      rc = send(ssl->fd,
+                reinterpret_cast<const char*>(ssl->pending_send.data() + ssl->pending_send_offset),
+                to_send,
+                0);
+    } else {
+      ssl->last_error = SSL_ERROR_SSL;
+      ssl->last_ret = -1;
+      set_error_message("no transport for encrypted TLS output");
+      return false;
+    }
+
     if (rc < 0) {
-      if (is_socket_would_block()) {
+      bool would_block = socket_transport ? is_socket_would_block() : true;
+      if (would_block) {
         ssl->last_error = SSL_ERROR_WANT_WRITE;
         ssl->last_ret = -1;
-        return false;
+      } else {
+        ssl->last_error = SSL_ERROR_SYSCALL;
+        ssl->last_ret = -1;
+        set_error_message("transport send failed");
       }
-      ssl->last_error = SSL_ERROR_SYSCALL;
-      ssl->last_ret = -1;
-      set_error_message("socket send failed");
       return false;
     }
+
     if (rc == 0) {
-      ssl->last_error = SSL_ERROR_ZERO_RETURN;
-      ssl->last_ret = 0;
+      if (!socket_transport) {
+        ssl->last_error = SSL_ERROR_WANT_WRITE;
+        ssl->last_ret = -1;
+      } else {
+        ssl->last_error = SSL_ERROR_ZERO_RETURN;
+        ssl->last_ret = 0;
+      }
       return false;
     }
+
     ssl->pending_send_offset += static_cast<size_t>(rc);
   }
 
@@ -697,21 +735,43 @@ bool recv_into_handshake_buffer(SSL* ssl) {
   }
 
   std::array<unsigned char, 16 * 1024> tmp{};
-  int rc = recv(ssl->fd, reinterpret_cast<char*>(tmp.data()), static_cast<int>(tmp.size()), 0);
-  if (rc < 0) {
-    if (is_socket_would_block()) {
-      ssl->last_error = SSL_ERROR_WANT_READ;
-      ssl->last_ret = -1;
-      return false;
-    }
-    ssl->last_error = SSL_ERROR_SYSCALL;
+  int rc = -1;
+  bool socket_transport = false;
+
+  if (ssl->rbio) {
+    socket_transport = ssl->rbio->kind == BioKind::Socket;
+    rc = BIO_read(ssl->rbio, tmp.data(), static_cast<int>(tmp.size()));
+  } else if (ssl->fd >= 0) {
+    socket_transport = true;
+    rc = recv(ssl->fd, reinterpret_cast<char*>(tmp.data()), static_cast<int>(tmp.size()), 0);
+  } else {
+    ssl->last_error = SSL_ERROR_SSL;
     ssl->last_ret = -1;
-    set_error_message("socket recv failed");
+    set_error_message("no transport for encrypted TLS input");
     return false;
   }
+
+  if (rc < 0) {
+    bool would_block = socket_transport ? is_socket_would_block() : true;
+    if (would_block) {
+      ssl->last_error = SSL_ERROR_WANT_READ;
+      ssl->last_ret = -1;
+    } else {
+      ssl->last_error = SSL_ERROR_SYSCALL;
+      ssl->last_ret = -1;
+      set_error_message("transport recv failed");
+    }
+    return false;
+  }
+
   if (rc == 0) {
-    ssl->last_error = SSL_ERROR_ZERO_RETURN;
-    ssl->last_ret = 0;
+    if (!socket_transport) {
+      ssl->last_error = SSL_ERROR_WANT_READ;
+      ssl->last_ret = -1;
+    } else {
+      ssl->last_error = SSL_ERROR_ZERO_RETURN;
+      ssl->last_ret = 0;
+    }
     return false;
   }
 
@@ -724,33 +784,39 @@ DWORD tls_protocol_flags(const SSL_CTX* ctx, bool client) {
   DWORD p = 0;
 
   int minv = ctx->min_proto_version;
+  int maxv = ctx->max_proto_version;
+  if (maxv == 0) maxv = TLS1_3_VERSION;
+  if (minv > maxv) std::swap(minv, maxv);
+
+  auto enabled = [minv, maxv](int version) {
+    return version >= minv && version <= maxv;
+  };
+
   if (client) {
-#ifdef SP_PROT_TLS1_3_CLIENT
-    if (minv <= TLS1_2_VERSION) p |= SP_PROT_TLS1_3_CLIENT;
-    if (minv <= TLS1_3_VERSION && minv > TLS1_2_VERSION) p |= SP_PROT_TLS1_3_CLIENT;
-#endif
-#ifdef SP_PROT_TLS1_2_CLIENT
-    if (minv <= TLS1_2_VERSION) p |= SP_PROT_TLS1_2_CLIENT;
+#ifdef SP_PROT_TLS1_CLIENT
+    if (enabled(TLS1_VERSION)) p |= SP_PROT_TLS1_CLIENT;
 #endif
 #ifdef SP_PROT_TLS1_1_CLIENT
-    if (minv <= TLS1_1_VERSION) p |= SP_PROT_TLS1_1_CLIENT;
+    if (enabled(TLS1_1_VERSION)) p |= SP_PROT_TLS1_1_CLIENT;
 #endif
-#ifdef SP_PROT_TLS1_CLIENT
-    if (minv <= TLS1_VERSION) p |= SP_PROT_TLS1_CLIENT;
+#ifdef SP_PROT_TLS1_2_CLIENT
+    if (enabled(TLS1_2_VERSION)) p |= SP_PROT_TLS1_2_CLIENT;
+#endif
+#ifdef SP_PROT_TLS1_3_CLIENT
+    if (enabled(TLS1_3_VERSION)) p |= SP_PROT_TLS1_3_CLIENT;
 #endif
   } else {
-#ifdef SP_PROT_TLS1_3_SERVER
-    if (minv <= TLS1_2_VERSION) p |= SP_PROT_TLS1_3_SERVER;
-    if (minv <= TLS1_3_VERSION && minv > TLS1_2_VERSION) p |= SP_PROT_TLS1_3_SERVER;
-#endif
-#ifdef SP_PROT_TLS1_2_SERVER
-    if (minv <= TLS1_2_VERSION) p |= SP_PROT_TLS1_2_SERVER;
+#ifdef SP_PROT_TLS1_SERVER
+    if (enabled(TLS1_VERSION)) p |= SP_PROT_TLS1_SERVER;
 #endif
 #ifdef SP_PROT_TLS1_1_SERVER
-    if (minv <= TLS1_1_VERSION) p |= SP_PROT_TLS1_1_SERVER;
+    if (enabled(TLS1_1_VERSION)) p |= SP_PROT_TLS1_1_SERVER;
 #endif
-#ifdef SP_PROT_TLS1_SERVER
-    if (minv <= TLS1_VERSION) p |= SP_PROT_TLS1_SERVER;
+#ifdef SP_PROT_TLS1_2_SERVER
+    if (enabled(TLS1_2_VERSION)) p |= SP_PROT_TLS1_2_SERVER;
+#endif
+#ifdef SP_PROT_TLS1_3_SERVER
+    if (enabled(TLS1_3_VERSION)) p |= SP_PROT_TLS1_3_SERVER;
 #endif
   }
 
@@ -1216,6 +1282,7 @@ bool schannel_handshake(SSL* ssl) {
     }
 
     if (st == SEC_I_CONTEXT_EXPIRED) {
+      ssl->shutdown_state |= SSL_RECEIVED_SHUTDOWN;
       ssl->last_error = SSL_ERROR_ZERO_RETURN;
       ssl->last_ret = 0;
       return false;
@@ -1263,6 +1330,7 @@ bool ensure_decrypted_data(SSL* ssl) {
     }
 
     if (st == SEC_I_CONTEXT_EXPIRED) {
+      ssl->shutdown_state |= SSL_RECEIVED_SHUTDOWN;
       ssl->last_error = SSL_ERROR_ZERO_RETURN;
       ssl->last_ret = 0;
       return false;
@@ -1310,7 +1378,7 @@ bool ensure_decrypted_data(SSL* ssl) {
 }
 
 bool send_close_notify(SSL* ssl) {
-  if (!ssl || !ssl->ctxt_valid || ssl->fd < 0) return false;
+  if (!ssl || !ssl->ctxt_valid || !has_ssl_transport(ssl)) return false;
 
   if (!ssl->pending_send.empty()) {
     if (!flush_pending_send(ssl)) return false;
@@ -1410,6 +1478,25 @@ bool next_pem_block(BIO* bio, const char* begin_tag, const char* end_tag,
   return true;
 }
 
+size_t bio_pending_bytes(const BIO* bio) {
+  if (!bio || bio->offset >= bio->data.size()) return 0;
+  return bio->data.size() - bio->offset;
+}
+
+void bio_compact(BIO* bio) {
+  if (!bio || bio->offset == 0) return;
+  if (bio->offset >= bio->data.size()) {
+    bio->data.clear();
+    bio->offset = 0;
+    return;
+  }
+
+  if (bio->offset > 4096) {
+    bio->data.erase(bio->data.begin(), bio->data.begin() + static_cast<std::ptrdiff_t>(bio->offset));
+    bio->offset = 0;
+  }
+}
+
 bool load_ca_file_into_store(X509_STORE* store, const char* file) {
   if (!store || !file || !*file) return false;
   auto pem = read_file_text(file);
@@ -1500,13 +1587,83 @@ long BIO_get_mem_data(BIO* bio, char** pp) {
   if (pp) {
     *pp = reinterpret_cast<char*>(bio->data.data() + bio->offset);
   }
-  return static_cast<long>(bio->data.size() - bio->offset);
+  return static_cast<long>(bio_pending_bytes(bio));
 }
+
+int BIO_new_bio_pair(BIO** bio1, size_t /*writebuf1*/, BIO** bio2, size_t /*writebuf2*/) {
+  if (!bio1 || !bio2) return 0;
+  auto* a = new BIO();
+  auto* b = new BIO();
+  a->kind = BioKind::Pair;
+  b->kind = BioKind::Pair;
+  a->pair = b;
+  b->pair = a;
+  *bio1 = a;
+  *bio2 = b;
+  return 1;
+}
+
+int BIO_read(BIO* bio, void* data, int len) {
+  if (!bio || !data || len <= 0) return -1;
+
+  if ((bio->kind == BioKind::Memory || bio->kind == BioKind::Pair) && bio_pending_bytes(bio) > 0) {
+    int n = static_cast<int>((std::min)(static_cast<size_t>(len), bio_pending_bytes(bio)));
+    std::memcpy(data, bio->data.data() + bio->offset, static_cast<size_t>(n));
+    bio->offset += static_cast<size_t>(n);
+    bio_compact(bio);
+    return n;
+  }
+
+  if (bio->kind == BioKind::Socket && bio->fd >= 0) {
+#ifdef _WIN32
+    return recv(bio->fd, static_cast<char*>(data), len, 0);
+#else
+    return static_cast<int>(recv(bio->fd, data, static_cast<size_t>(len), 0));
+#endif
+  }
+
+  return -1;
+}
+
+int BIO_write(BIO* bio, const void* data, int len) {
+  if (!bio || !data || len <= 0) return -1;
+
+  if (bio->kind == BioKind::Pair) {
+    if (!bio->pair) return -1;
+    auto* dst = bio->pair;
+    dst->data.insert(dst->data.end(), static_cast<const unsigned char*>(data),
+                     static_cast<const unsigned char*>(data) + len);
+    return len;
+  }
+
+  if (bio->kind == BioKind::Memory) {
+    bio->data.insert(bio->data.end(), static_cast<const unsigned char*>(data),
+                     static_cast<const unsigned char*>(data) + len);
+    return len;
+  }
+
+  if (bio->kind == BioKind::Socket && bio->fd >= 0) {
+#ifdef _WIN32
+    return send(bio->fd, static_cast<const char*>(data), len, 0);
+#else
+    return static_cast<int>(send(bio->fd, data, static_cast<size_t>(len), 0));
+#endif
+  }
+
+  return -1;
+}
+
+size_t BIO_ctrl_pending(BIO* bio) { return bio_pending_bytes(bio); }
+
+size_t BIO_wpending(BIO* bio) { return bio_pending_bytes(bio); }
 
 int BIO_free(BIO* a) {
   if (!a) return 0;
   if (a->kind == BioKind::Socket && a->close_on_free && a->fd >= 0) {
     close_socket_fd(a->fd);
+  }
+  if (a->kind == BioKind::Pair && a->pair) {
+    a->pair->pair = nullptr;
   }
   delete a;
   return 1;
@@ -1807,6 +1964,10 @@ int PEM_write_bio_PrivateKey(BIO* bp, EVP_PKEY* x, const void* /*enc*/, unsigned
 }
 
 /* ===== SSL methods/context ===== */
+const SSL_METHOD* TLS_method(void) { return TLS_client_method(); }
+
+const SSL_METHOD* SSLv23_method(void) { return TLS_method(); }
+
 SSL_CTX* SSL_CTX_new(const SSL_METHOD* method) {
   auto* ctx = new SSL_CTX();
   ctx->is_client = !(method && method->endpoint == 1);
@@ -1820,6 +1981,20 @@ void SSL_CTX_set_verify(SSL_CTX* ctx, int mode,
   if (!ctx) return;
   ctx->verify_mode = mode;
   ctx->verify_callback = verify_callback;
+}
+
+int SSL_CTX_get_verify_mode(const SSL_CTX* ctx) {
+  return ctx ? ctx->verify_mode : SSL_VERIFY_NONE;
+}
+
+int (*SSL_CTX_get_verify_callback(const SSL_CTX* ctx))(int, X509_STORE_CTX*) {
+  return ctx ? ctx->verify_callback : nullptr;
+}
+
+long SSL_CTX_clear_options(SSL_CTX* ctx, long options) {
+  if (!ctx) return 0;
+  ctx->options &= ~options;
+  return ctx->options;
 }
 
 static bool add_cipher_from_token(const std::string& token) {
@@ -2059,9 +2234,27 @@ void SSL_CTX_set_cert_store(SSL_CTX* ctx, X509_STORE* store) {
   ctx->cert_store = store;
 }
 
+void SSL_CTX_set_default_passwd_cb(SSL_CTX* ctx, pem_password_cb* cb) {
+  if (ctx) ctx->passwd_cb = cb;
+}
+
+pem_password_cb* SSL_CTX_get_default_passwd_cb(SSL_CTX* ctx) {
+  return ctx ? ctx->passwd_cb : nullptr;
+}
+
+void* SSL_CTX_get_default_passwd_cb_userdata(SSL_CTX* ctx) {
+  return ctx ? ctx->passwd_userdata : nullptr;
+}
+
 int SSL_CTX_set_min_proto_version(SSL_CTX* ctx, int version) {
   if (!ctx) return 0;
   ctx->min_proto_version = version;
+  return 1;
+}
+
+int SSL_CTX_set_max_proto_version(SSL_CTX* ctx, int version) {
+  if (!ctx) return 0;
+  ctx->max_proto_version = version;
   return 1;
 }
 
@@ -2088,7 +2281,9 @@ SSL* SSL_new(SSL_CTX* ctx) {
   auto* ssl = new SSL();
   ssl->ctx = ctx;
   ssl->verify_mode = ctx->verify_mode;
+  ssl->verify_depth = ctx->verify_depth;
   ssl->verify_callback = ctx->verify_callback;
+  ssl->mode = ctx->mode;
   ssl->verify_result = X509_V_OK;
   return ssl;
 }
@@ -2109,10 +2304,12 @@ void SSL_set_bio(SSL* ssl, BIO* rbio, BIO* wbio) {
     }
   }
   ssl->rbio = rbio;
-  ssl->wbio = wbio;
+  ssl->wbio = wbio ? wbio : rbio;
 
-  if (rbio && rbio->kind == BioKind::Socket) {
-    ssl->fd = rbio->fd;
+  if (ssl->rbio && ssl->rbio->kind == BioKind::Socket) {
+    ssl->fd = ssl->rbio->fd;
+  } else {
+    ssl->fd = -1;
   }
 }
 
@@ -2129,13 +2326,35 @@ void SSL_set_verify(SSL* ssl, int mode,
   ssl->verify_callback = verify_callback;
 }
 
+int SSL_get_verify_mode(const SSL* ssl) {
+  return ssl ? ssl->verify_mode : SSL_VERIFY_NONE;
+}
+
+int (*SSL_get_verify_callback(const SSL* ssl))(int, X509_STORE_CTX*) {
+  return ssl ? ssl->verify_callback : nullptr;
+}
+
+void SSL_set_verify_depth(SSL* ssl, int depth) {
+  if (ssl) ssl->verify_depth = depth;
+}
+
+long SSL_set_mode(SSL* ssl, long mode) {
+  if (!ssl) return 0;
+  ssl->mode |= mode;
+  return ssl->mode;
+}
+
+SSL_CTX* SSL_get_SSL_CTX(const SSL* ssl) {
+  return ssl ? ssl->ctx : nullptr;
+}
+
 int SSL_connect(SSL* ssl) {
 #ifdef _WIN32
   if (!ssl || !ssl->ctx || !ssl->ctx->is_client) return -1;
-  if (ssl->fd < 0) {
+  if (!has_ssl_transport(ssl)) {
     ssl->last_error = SSL_ERROR_SYSCALL;
     ssl->last_ret = -1;
-    set_error_message("SSL_connect with invalid socket");
+    set_error_message("SSL_connect with no transport");
     return -1;
   }
 
@@ -2170,10 +2389,10 @@ int SSL_connect(SSL* ssl) {
 int SSL_accept(SSL* ssl) {
 #ifdef _WIN32
   if (!ssl || !ssl->ctx || ssl->ctx->is_client) return -1;
-  if (ssl->fd < 0) {
+  if (!has_ssl_transport(ssl)) {
     ssl->last_error = SSL_ERROR_SYSCALL;
     ssl->last_ret = -1;
-    set_error_message("SSL_accept with invalid socket");
+    set_error_message("SSL_accept with no transport");
     return -1;
   }
 
@@ -2356,14 +2575,22 @@ int SSL_shutdown(SSL* ssl) {
 #ifdef _WIN32
   if (!ssl) return 0;
 
-  if (!ssl->shutdown_sent && ssl->fd >= 0) {
-    if (ssl->ctxt_valid) {
+  if (!ssl->shutdown_sent) {
+    if (ssl->ctxt_valid && has_ssl_transport(ssl)) {
       if (!send_close_notify(ssl)) {
-        return 0;
+        if (ssl->last_error == SSL_ERROR_WANT_READ || ssl->last_error == SSL_ERROR_WANT_WRITE) {
+          return 0;
+        }
+        return -1;
       }
     }
-    shutdown(ssl->fd, SD_SEND);
+
+    if (ssl->fd >= 0) {
+      shutdown(ssl->fd, SD_SEND);
+    }
+
     ssl->shutdown_sent = true;
+    ssl->shutdown_state |= SSL_SENT_SHUTDOWN;
   }
 
   ssl->last_ret = 1;
@@ -2373,6 +2600,16 @@ int SSL_shutdown(SSL* ssl) {
   (void)ssl;
   return 1;
 #endif
+}
+
+int SSL_get_shutdown(const SSL* ssl) {
+  if (!ssl) return 0;
+  int state = ssl->shutdown_state;
+  if ((state & SSL_RECEIVED_SHUTDOWN) == 0 && ssl->handshake_done && ssl->fd < 0 && ssl->rbio &&
+      ssl->rbio->kind == BioKind::Pair) {
+    state |= SSL_RECEIVED_SHUTDOWN;
+  }
+  return state;
 }
 
 X509* SSL_get_peer_certificate(const SSL* ssl) {
@@ -2392,8 +2629,8 @@ const char* SSL_get_servername(const SSL* ssl, const int type) {
 }
 
 void SSL_clear_mode(SSL* ssl, long mode) {
-  if (!ssl || !ssl->ctx) return;
-  ssl->ctx->mode &= ~mode;
+  if (!ssl) return;
+  ssl->mode &= ~mode;
 }
 
 STACK_OF_X509_NAME* SSL_load_client_CA_file(const char* file) {
