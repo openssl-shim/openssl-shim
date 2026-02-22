@@ -216,6 +216,11 @@ struct ssl_ctx_st {
 
   X509* own_cert = nullptr;
   EVP_PKEY* own_key = nullptr;
+  std::vector<X509*> own_chain;
+#ifdef _WIN32
+  HCERTSTORE user_intermediate_store = nullptr;
+  std::vector<PCCERT_CONTEXT> installed_chain_certs;
+#endif
 
   std::vector<std::string> alpn_protocols;
   std::vector<unsigned char> alpn_wire;
@@ -227,6 +232,19 @@ struct ssl_ctx_st {
     if (cert_store) X509_STORE_free(cert_store);
     if (own_cert) X509_free(own_cert);
     if (own_key) EVP_PKEY_free(own_key);
+    for (auto* cert : own_chain) {
+      if (cert) X509_free(cert);
+    }
+#ifdef _WIN32
+    for (auto* cert_ctx : installed_chain_certs) {
+      if (cert_ctx) CertDeleteCertificateFromStore(cert_ctx);
+    }
+    installed_chain_certs.clear();
+    if (user_intermediate_store) {
+      CertCloseStore(user_intermediate_store, 0);
+      user_intermediate_store = nullptr;
+    }
+#endif
   }
 };
 
@@ -262,6 +280,9 @@ struct ssl_st {
   bool ctxt_valid = false;
   bool handshake_started = false;
   bool handshake_done = false;
+
+  HCERTSTORE server_cred_store = nullptr;
+  PCCERT_CONTEXT server_cred_cert = nullptr;
 
   SecPkgContext_StreamSizes sizes{};
   bool have_sizes = false;
@@ -300,6 +321,14 @@ struct ssl_st {
     if (cred_valid) {
       FreeCredentialsHandle(&cred);
       cred_valid = false;
+    }
+    if (server_cred_cert) {
+      CertFreeCertificateContext(server_cred_cert);
+      server_cred_cert = nullptr;
+    }
+    if (server_cred_store) {
+      CertCloseStore(server_cred_store, 0);
+      server_cred_store = nullptr;
     }
 #endif
   }
@@ -398,6 +427,60 @@ std::string wrap_pem(const char* tag, const unsigned char* data, DWORD len) {
   return out;
 }
 
+void der_append_length(std::vector<unsigned char>& out, size_t len) {
+  if (len < 0x80) {
+    out.push_back(static_cast<unsigned char>(len));
+    return;
+  }
+
+  std::array<unsigned char, sizeof(size_t)> tmp{};
+  size_t n = 0;
+  while (len > 0 && n < tmp.size()) {
+    tmp[tmp.size() - 1 - n] = static_cast<unsigned char>(len & 0xFF);
+    len >>= 8;
+    ++n;
+  }
+
+  out.push_back(static_cast<unsigned char>(0x80 | n));
+  out.insert(out.end(), tmp.end() - static_cast<std::ptrdiff_t>(n), tmp.end());
+}
+
+void der_append_tlv(std::vector<unsigned char>& out,
+                    unsigned char tag,
+                    const unsigned char* data,
+                    size_t len) {
+  out.push_back(tag);
+  der_append_length(out, len);
+  if (data && len > 0) {
+    out.insert(out.end(), data, data + len);
+  }
+}
+
+bool wrap_rsa_pkcs1_key_as_pkcs8(const std::vector<unsigned char>& pkcs1_der,
+                                 std::vector<unsigned char>& pkcs8_der) {
+  if (pkcs1_der.empty() || pkcs1_der[0] != 0x30) return false;
+
+  static constexpr unsigned char kRsaAlgorithmIdentifier[] = {
+      0x30, 0x0D,
+      0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01,
+      0x05, 0x00};
+
+  std::vector<unsigned char> body;
+  body.push_back(0x02); // INTEGER version
+  body.push_back(0x01);
+  body.push_back(0x00);
+  body.insert(body.end(),
+              kRsaAlgorithmIdentifier,
+              kRsaAlgorithmIdentifier + sizeof(kRsaAlgorithmIdentifier));
+  der_append_tlv(body, 0x04, pkcs1_der.data(), pkcs1_der.size()); // OCTET STRING privateKey
+
+  pkcs8_der.clear();
+  pkcs8_der.push_back(0x30); // SEQUENCE
+  der_append_length(pkcs8_der, body.size());
+  pkcs8_der.insert(pkcs8_der.end(), body.begin(), body.end());
+  return true;
+}
+
 time_t filetime_to_time_t(const FILETIME& ft) {
   ULARGE_INTEGER ui{};
   ui.LowPart = ft.dwLowDateTime;
@@ -476,7 +559,93 @@ X509* x509_from_der(const unsigned char* der, size_t len) {
 
 X509* x509_from_context(PCCERT_CONTEXT cert) {
   if (!cert || !cert->pbCertEncoded || cert->cbCertEncoded == 0) return nullptr;
-  return x509_from_der(cert->pbCertEncoded, cert->cbCertEncoded);
+
+  PCCERT_CONTEXT dup = CertDuplicateCertificateContext(cert);
+  if (!dup) return nullptr;
+
+  auto* x = new X509();
+  x->cert_ctx = dup;
+  x->der.assign(cert->pbCertEncoded, cert->pbCertEncoded + cert->cbCertEncoded);
+  refresh_x509_fields(x);
+  return x;
+}
+
+void clear_ctx_installed_chain_certs(SSL_CTX* ctx) {
+  if (!ctx) return;
+  for (auto* cert_ctx : ctx->installed_chain_certs) {
+    if (cert_ctx) {
+      CertDeleteCertificateFromStore(cert_ctx);
+    }
+  }
+  ctx->installed_chain_certs.clear();
+}
+
+bool ensure_ctx_user_intermediate_store(SSL_CTX* ctx) {
+  if (!ctx) return false;
+  if (ctx->user_intermediate_store) return true;
+
+  ctx->user_intermediate_store = CertOpenStore(CERT_STORE_PROV_SYSTEM_A,
+                                                0,
+                                                0,
+                                                CERT_SYSTEM_STORE_CURRENT_USER,
+                                                "CA");
+  if (!ctx->user_intermediate_store) {
+    set_error_message("failed to open CurrentUser\\CA certificate store: " +
+                      std::to_string(GetLastError()));
+    return false;
+  }
+  return true;
+}
+
+bool sync_ctx_chain_to_user_intermediate_store(SSL_CTX* ctx) {
+  if (!ctx) return false;
+
+  clear_ctx_installed_chain_certs(ctx);
+  if (ctx->own_chain.empty()) return true;
+
+  if (!ensure_ctx_user_intermediate_store(ctx)) return false;
+
+  for (auto* cert : ctx->own_chain) {
+    if (!cert || !cert->cert_ctx) continue;
+
+    PCCERT_CONTEXT existing = CertFindCertificateInStore(ctx->user_intermediate_store,
+                                                         X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                                                         0,
+                                                         CERT_FIND_EXISTING,
+                                                         cert->cert_ctx,
+                                                         nullptr);
+    if (existing) {
+      CertFreeCertificateContext(existing);
+      continue;
+    }
+
+    PCCERT_CONTEXT added = nullptr;
+    if (!CertAddCertificateContextToStore(ctx->user_intermediate_store,
+                                          cert->cert_ctx,
+                                          CERT_STORE_ADD_NEW,
+                                          &added) ||
+        !added) {
+      DWORD err = GetLastError();
+      if (err == CRYPT_E_EXISTS) continue;
+      set_error_message("failed to add intermediate certificate to CurrentUser\\CA store: " +
+                        std::to_string(err));
+      clear_ctx_installed_chain_certs(ctx);
+      return false;
+    }
+
+    ctx->installed_chain_certs.push_back(added);
+  }
+
+  return true;
+}
+
+void clear_ctx_own_chain(SSL_CTX* ctx) {
+  if (!ctx) return;
+  clear_ctx_installed_chain_certs(ctx);
+  for (auto* cert : ctx->own_chain) {
+    if (cert) X509_free(cert);
+  }
+  ctx->own_chain.clear();
 }
 
 struct key_import_target {
@@ -561,8 +730,8 @@ bool import_private_key_pkcs8(const std::vector<unsigned char>& der, EVP_PKEY* o
   return true;
 }
 
-bool attach_private_key_to_cert(X509* cert, EVP_PKEY* pkey) {
-  if (!cert || !cert->cert_ctx || !pkey || !pkey->has_key) return false;
+bool attach_private_key_to_cert_context(PCCERT_CONTEXT cert_ctx, EVP_PKEY* pkey) {
+  if (!cert_ctx || !pkey || !pkey->has_key) return false;
   if (!pkey->use_ncrypt && !pkey->hprov) return false;
   if (pkey->use_ncrypt && !pkey->nkey) return false;
 
@@ -572,12 +741,12 @@ bool attach_private_key_to_cert(X509* cert, EVP_PKEY* pkey) {
     key_ctx.hNCryptKey = pkey->nkey;
     key_ctx.dwKeySpec = CERT_NCRYPT_KEY_SPEC;
 
-    CertSetCertificateContextProperty(cert->cert_ctx,
+    CertSetCertificateContextProperty(cert_ctx,
                                       CERT_NCRYPT_KEY_HANDLE_PROP_ID,
                                       0,
                                       &pkey->nkey);
 
-    if (!CertSetCertificateContextProperty(cert->cert_ctx,
+    if (!CertSetCertificateContextProperty(cert_ctx,
                                            CERT_KEY_CONTEXT_PROP_ID,
                                            CERT_SET_KEY_CONTEXT_PROP_ID,
                                            &key_ctx)) {
@@ -630,7 +799,7 @@ bool attach_private_key_to_cert(X509* cert, EVP_PKEY* pkey) {
   info.rgProvParam = nullptr;
   info.dwKeySpec = pkey->keyspec;
 
-  if (!CertSetCertificateContextProperty(cert->cert_ctx,
+  if (!CertSetCertificateContextProperty(cert_ctx,
                                          CERT_KEY_PROV_INFO_PROP_ID,
                                          0,
                                          &info)) {
@@ -640,6 +809,11 @@ bool attach_private_key_to_cert(X509* cert, EVP_PKEY* pkey) {
   }
 
   return true;
+}
+
+bool attach_private_key_to_cert(X509* cert, EVP_PKEY* pkey) {
+  if (!cert || !cert->cert_ctx) return false;
+  return attach_private_key_to_cert_context(cert->cert_ctx, pkey);
 }
 
 int map_sec_error_to_ssl_error(SECURITY_STATUS st) {
@@ -826,6 +1000,75 @@ DWORD tls_protocol_flags(const SSL_CTX* ctx, bool client) {
   return p;
 }
 
+void clear_ssl_server_cred_chain_cache(SSL* ssl) {
+  if (!ssl) return;
+  if (ssl->server_cred_cert) {
+    CertFreeCertificateContext(ssl->server_cred_cert);
+    ssl->server_cred_cert = nullptr;
+  }
+  if (ssl->server_cred_store) {
+    CertCloseStore(ssl->server_cred_store, 0);
+    ssl->server_cred_store = nullptr;
+  }
+}
+
+PCCERT_CONTEXT prepare_server_credential_certificate(SSL* ssl) {
+  if (!ssl || !ssl->ctx || !ssl->ctx->own_cert || !ssl->ctx->own_cert->cert_ctx) return nullptr;
+
+  if (ssl->ctx->own_chain.empty()) {
+    clear_ssl_server_cred_chain_cache(ssl);
+    return ssl->ctx->own_cert->cert_ctx;
+  }
+
+  if (ssl->server_cred_cert) return ssl->server_cred_cert;
+
+  HCERTSTORE chain_store = CertOpenStore(CERT_STORE_PROV_MEMORY,
+                                         X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                                         0,
+                                         CERT_STORE_CREATE_NEW_FLAG,
+                                         nullptr);
+  if (!chain_store) {
+    set_error_message("CertOpenStore for server chain failed: " + std::to_string(GetLastError()));
+    return nullptr;
+  }
+
+  PCCERT_CONTEXT leaf = nullptr;
+  if (!CertAddCertificateContextToStore(chain_store,
+                                        ssl->ctx->own_cert->cert_ctx,
+                                        CERT_STORE_ADD_ALWAYS,
+                                        &leaf) ||
+      !leaf) {
+    set_error_message("failed to add leaf certificate to server chain store: " +
+                      std::to_string(GetLastError()));
+    CertCloseStore(chain_store, 0);
+    return nullptr;
+  }
+
+  for (auto* cert : ssl->ctx->own_chain) {
+    if (!cert || !cert->cert_ctx) continue;
+    if (!CertAddCertificateContextToStore(chain_store,
+                                          cert->cert_ctx,
+                                          CERT_STORE_ADD_ALWAYS,
+                                          nullptr)) {
+      set_error_message("failed to add chain certificate to server chain store: " +
+                        std::to_string(GetLastError()));
+      CertFreeCertificateContext(leaf);
+      CertCloseStore(chain_store, 0);
+      return nullptr;
+    }
+  }
+
+  if (ssl->ctx->own_key && !attach_private_key_to_cert_context(leaf, ssl->ctx->own_key)) {
+    CertFreeCertificateContext(leaf);
+    CertCloseStore(chain_store, 0);
+    return nullptr;
+  }
+
+  ssl->server_cred_store = chain_store;
+  ssl->server_cred_cert = leaf;
+  return leaf;
+}
+
 bool ensure_credentials(SSL* ssl) {
   if (!ssl || !ssl->ctx) return false;
   if (ssl->cred_valid) return true;
@@ -839,17 +1082,31 @@ bool ensure_credentials(SSL* ssl) {
   cred.grbitEnabledProtocols = tls_protocol_flags(ssl->ctx, ssl->ctx->is_client);
 
   PCCERT_CONTEXT cert_ctx = nullptr;
-  if (ssl->ctx->own_cert && ssl->ctx->own_cert->cert_ctx) {
-    cert_ctx = ssl->ctx->own_cert->cert_ctx;
-  }
-
-  if (!ssl->ctx->is_client) {
-    if (!cert_ctx) {
+  if (ssl->ctx->is_client) {
+    if (ssl->ctx->own_cert && ssl->ctx->own_cert->cert_ctx) {
+      cert_ctx = ssl->ctx->own_cert->cert_ctx;
+    }
+  } else {
+    if (!ssl->ctx->own_cert || !ssl->ctx->own_cert->cert_ctx) {
       set_error_message("server credential requires certificate");
       ssl->last_error = SSL_ERROR_SSL;
       ssl->last_ret = -1;
       return false;
     }
+
+    cert_ctx = prepare_server_credential_certificate(ssl);
+    if (!cert_ctx) {
+      if (ERR_peek_last_error() == 0) {
+        set_error_message("server credential requires certificate");
+      }
+      ssl->last_error = SSL_ERROR_SSL;
+      ssl->last_ret = -1;
+      return false;
+    }
+  }
+
+  if (!ssl->ctx->is_client && ssl->server_cred_store) {
+    cred.hRootStore = ssl->server_cred_store;
   }
 
   if (cert_ctx) {
@@ -1934,20 +2191,43 @@ EVP_PKEY* PEM_read_bio_PrivateKey(BIO* bp, EVP_PKEY** x, pem_password_cb* /*cb*/
   if (!bp) return nullptr;
 
   std::string pem;
-  if (!next_pem_block(bp,
-                      "-----BEGIN PRIVATE KEY-----",
-                      "-----END PRIVATE KEY-----",
-                      pem)) {
-    return nullptr;
-  }
-
   std::vector<unsigned char> der;
-  if (!decode_pem_block_to_der(pem, der)) return nullptr;
+  size_t begin_offset = bp->offset;
+
+  if (next_pem_block(bp,
+                     "-----BEGIN PRIVATE KEY-----",
+                     "-----END PRIVATE KEY-----",
+                     pem)) {
+    if (!decode_pem_block_to_der(pem, der)) {
+      set_error_message("failed to decode PKCS#8 private key PEM", ERR_R_PEM_LIB, ERR_LIB_PEM);
+      return nullptr;
+    }
+  } else {
+    bp->offset = begin_offset;
+    if (!next_pem_block(bp,
+                        "-----BEGIN RSA PRIVATE KEY-----",
+                        "-----END RSA PRIVATE KEY-----",
+                        pem)) {
+      set_error_message("no private key PEM block found", PEM_R_NO_START_LINE, ERR_LIB_PEM);
+      return nullptr;
+    }
+
+    std::vector<unsigned char> rsa_der;
+    if (!decode_pem_block_to_der(pem, rsa_der)) {
+      set_error_message("failed to decode RSA private key PEM", ERR_R_PEM_LIB, ERR_LIB_PEM);
+      return nullptr;
+    }
+
+    if (!wrap_rsa_pkcs1_key_as_pkcs8(rsa_der, der)) {
+      set_error_message("failed to wrap RSA private key as PKCS#8", ERR_R_PEM_LIB, ERR_LIB_PEM);
+      return nullptr;
+    }
+  }
 
   auto* pkey = new EVP_PKEY();
   if (!import_private_key_pkcs8(der, pkey)) {
     delete pkey;
-    set_error_message("failed to import PKCS#8 private key");
+    set_error_message("failed to import private key", ERR_R_PEM_LIB, ERR_LIB_PEM);
     return nullptr;
   }
   pkey->pkcs8_der = std::move(der);
@@ -2129,16 +2409,25 @@ int SSL_CTX_set_default_verify_paths(SSL_CTX* ctx) {
 int SSL_CTX_use_certificate_file(SSL_CTX* ctx, const char* file, int /*type*/) {
   if (!ctx || !file) return 0;
   auto pem = read_file_text(file);
-  if (pem.empty()) return 0;
+  if (pem.empty()) {
+    set_error_message("failed to read certificate file", ERR_R_PEM_LIB, ERR_LIB_PEM);
+    return 0;
+  }
 
   auto* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
   if (!bio) return 0;
   auto* cert = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
   BIO_free(bio);
-  if (!cert) return 0;
+  if (!cert) {
+    if (ERR_peek_last_error() == 0) {
+      set_error_message("failed to parse certificate PEM", ERR_R_PEM_LIB, ERR_LIB_PEM);
+    }
+    return 0;
+  }
 
   if (ctx->own_cert) X509_free(ctx->own_cert);
   ctx->own_cert = cert;
+  clear_ctx_own_chain(ctx);
 
 #ifdef _WIN32
   if (ctx->own_cert && ctx->own_key) {
@@ -2155,13 +2444,64 @@ int SSL_CTX_use_certificate_file(SSL_CTX* ctx, const char* file, int /*type*/) {
 }
 
 int SSL_CTX_use_certificate_chain_file(SSL_CTX* ctx, const char* file) {
-  return SSL_CTX_use_certificate_file(ctx, file, SSL_FILETYPE_PEM);
+  if (!ctx || !file) return 0;
+  auto pem = read_file_text(file);
+  if (pem.empty()) {
+    set_error_message("failed to read certificate chain file", ERR_R_PEM_LIB, ERR_LIB_PEM);
+    return 0;
+  }
+
+  auto* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+  if (!bio) return 0;
+
+  std::vector<X509*> certs;
+  while (true) {
+    auto* cert = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+    if (!cert) break;
+    certs.push_back(cert);
+  }
+  BIO_free(bio);
+
+  if (certs.empty()) {
+    if (ERR_peek_last_error() == 0) {
+      set_error_message("failed to parse certificate chain PEM", ERR_R_PEM_LIB, ERR_LIB_PEM);
+    }
+    return 0;
+  }
+
+  if (ctx->own_cert) X509_free(ctx->own_cert);
+  ctx->own_cert = certs.front();
+
+  clear_ctx_own_chain(ctx);
+  for (size_t i = 1; i < certs.size(); ++i) {
+    ctx->own_chain.push_back(certs[i]);
+  }
+
+#ifdef _WIN32
+  if (!sync_ctx_chain_to_user_intermediate_store(ctx)) {
+    return 0;
+  }
+
+  if (ctx->own_cert && ctx->own_key) {
+    if (!attach_private_key_to_cert(ctx->own_cert, ctx->own_key)) {
+      if (ERR_peek_last_error() == 0) {
+        set_error_message("failed to bind private key to certificate");
+      }
+      return 0;
+    }
+  }
+#endif
+
+  return 1;
 }
 
 int SSL_CTX_use_PrivateKey_file(SSL_CTX* ctx, const char* file, int /*type*/) {
   if (!ctx || !file) return 0;
   auto pem = read_file_text(file);
-  if (pem.empty()) return 0;
+  if (pem.empty()) {
+    set_error_message("failed to read private key file", ERR_R_PEM_LIB, ERR_LIB_PEM);
+    return 0;
+  }
 
   std::string passwd;
   void* passwd_arg = ctx->passwd_userdata;
@@ -2181,7 +2521,12 @@ int SSL_CTX_use_PrivateKey_file(SSL_CTX* ctx, const char* file, int /*type*/) {
                                        ctx->passwd_cb,
                                        passwd_arg);
   BIO_free(bio);
-  if (!pkey) return 0;
+  if (!pkey) {
+    if (ERR_peek_last_error() == 0) {
+      set_error_message("failed to parse private key PEM", ERR_R_PEM_LIB, ERR_LIB_PEM);
+    }
+    return 0;
+  }
 
   if (ctx->own_key) EVP_PKEY_free(ctx->own_key);
   ctx->own_key = pkey;
@@ -2205,6 +2550,7 @@ int SSL_CTX_use_certificate(SSL_CTX* ctx, X509* x) {
   if (ctx->own_cert) X509_free(ctx->own_cert);
   X509_up_ref(x);
   ctx->own_cert = x;
+  clear_ctx_own_chain(ctx);
 #ifdef _WIN32
   if (ctx->own_cert && ctx->own_key) {
     if (!attach_private_key_to_cert(ctx->own_cert, ctx->own_key)) return 0;
@@ -2222,6 +2568,7 @@ int SSL_CTX_use_certificate_ASN1(SSL_CTX* ctx, int len, const unsigned char* d) 
 
   if (ctx->own_cert) X509_free(ctx->own_cert);
   ctx->own_cert = cert;
+  clear_ctx_own_chain(ctx);
 
   if (ctx->own_cert && ctx->own_key) {
     if (!attach_private_key_to_cert(ctx->own_cert, ctx->own_key)) {
@@ -2309,12 +2656,29 @@ int SSL_CTX_check_private_key(const SSL_CTX* ctx) {
 #endif
 }
 
-int SSL_CTX_add_extra_chain_cert(SSL_CTX* /*ctx*/, X509* x509) {
-  if (x509) X509_free(x509);
+int SSL_CTX_add_extra_chain_cert(SSL_CTX* ctx, X509* x509) {
+  if (!ctx) {
+    if (x509) X509_free(x509);
+    return 0;
+  }
+
+  if (x509) {
+    ctx->own_chain.push_back(x509);
+  }
+
+#ifdef _WIN32
+  if (!sync_ctx_chain_to_user_intermediate_store(ctx)) {
+    return 0;
+  }
+#endif
+
   return 1;
 }
 
-void SSL_CTX_clear_chain_certs(SSL_CTX* /*ctx*/) {}
+void SSL_CTX_clear_chain_certs(SSL_CTX* ctx) {
+  if (!ctx) return;
+  clear_ctx_own_chain(ctx);
+}
 
 void SSL_CTX_set_cert_store(SSL_CTX* ctx, X509_STORE* store) {
   if (!ctx || !store) return;
