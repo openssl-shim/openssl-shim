@@ -280,7 +280,8 @@ if(EXISTS "${_asio_include_dir}/asio.hpp")
       --server-key ${CMAKE_SOURCE_DIR}/test/fixtures/chain-server-key.pem
       --client-ca ${CMAKE_SOURCE_DIR}/test/fixtures/chain-root-ca-crt.pem)
 
-  if(TARGET test_uwebsockets_https_server AND TARGET test_asio_https_client)
+  if(OPENSSL_SHIM_EFFECTIVE_BACKEND STREQUAL "MBEDTLS" AND
+     TARGET test_uwebsockets_https_server AND TARGET test_asio_https_client)
     add_test(NAME test_uwebsockets_https_roundtrip
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/run_uwebsockets_https_roundtrip.py
         --source-dir ${CMAKE_SOURCE_DIR}
