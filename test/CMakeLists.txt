@@ -13,6 +13,8 @@ endfunction()
 set(_cpp_httplib_dir "${CMAKE_SOURCE_DIR}/test/cpp-httplib")
 set(_ixws_dir "${CMAKE_SOURCE_DIR}/test/IXWebSocket")
 set(_asio_include_dir "${CMAKE_SOURCE_DIR}/test/asio/asio/include")
+set(_uwebsockets_dir "${CMAKE_SOURCE_DIR}/test/uWebSockets")
+set(_usockets_dir "${_uwebsockets_dir}/uSockets")
 
 # ---- cpp-httplib ----
 set(HTTPLIB_USE_OPENSSL_IF_AVAILABLE ON CACHE BOOL "" FORCE)
@@ -169,6 +171,53 @@ if(EXISTS "${_asio_include_dir}/asio.hpp")
   endif()
 endif()
 
+if(NOT WIN32 AND
+   EXISTS "${_uwebsockets_dir}/src/App.h" AND
+   EXISTS "${_usockets_dir}/src/libusockets.h")
+  add_library(test_usockets STATIC
+    ${_usockets_dir}/src/bsd.c
+    ${_usockets_dir}/src/context.c
+    ${_usockets_dir}/src/loop.c
+    ${_usockets_dir}/src/socket.c
+    ${_usockets_dir}/src/udp.c
+    ${_usockets_dir}/src/eventing/epoll_kqueue.c
+    ${_usockets_dir}/src/crypto/openssl.c
+    ${_usockets_dir}/src/crypto/sni_tree.cpp)
+  set_target_properties(test_usockets PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED ON
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON)
+
+  target_include_directories(test_usockets PUBLIC ${_usockets_dir}/src)
+  target_link_libraries(test_usockets PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+  target_compile_definitions(test_usockets PUBLIC LIBUS_USE_OPENSSL)
+  if(APPLE)
+    target_compile_definitions(test_usockets PUBLIC LIBUS_USE_KQUEUE)
+  else()
+    target_compile_definitions(test_usockets PUBLIC LIBUS_USE_EPOLL)
+  endif()
+
+  find_package(Threads REQUIRED)
+  target_link_libraries(test_usockets PUBLIC Threads::Threads)
+
+  add_executable(test_uwebsockets_https_server test_uwebsockets_https_server.cpp)
+  target_include_directories(test_uwebsockets_https_server PRIVATE
+    ${_uwebsockets_dir}/src
+    ${_usockets_dir}/src)
+  target_compile_definitions(test_uwebsockets_https_server PRIVATE UWS_NO_ZLIB LIBUS_USE_OPENSSL)
+  if(APPLE)
+    target_compile_definitions(test_uwebsockets_https_server PRIVATE LIBUS_USE_KQUEUE)
+  else()
+    target_compile_definitions(test_uwebsockets_https_server PRIVATE LIBUS_USE_EPOLL)
+  endif()
+  target_link_libraries(test_uwebsockets_https_server PRIVATE
+    test_usockets
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    Threads::Threads)
+endif()
+
 add_test(NAME test_httplib_client COMMAND test_httplib_client)
 add_test(NAME test_httplib_server COMMAND test_httplib_server)
 add_test(NAME test_httplib_verify_disabled COMMAND test_httplib_verify_disabled)
@@ -229,12 +278,25 @@ if(EXISTS "${_asio_include_dir}/asio.hpp")
       --server-key ${CMAKE_SOURCE_DIR}/test/fixtures/chain-server-key.pem
       --client-ca ${CMAKE_SOURCE_DIR}/test/fixtures/chain-root-ca-crt.pem)
 
+  if(TARGET test_uwebsockets_https_server AND TARGET test_asio_https_client)
+    add_test(NAME test_uwebsockets_https_roundtrip
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/run_uwebsockets_https_roundtrip.py
+        --source-dir ${CMAKE_SOURCE_DIR}
+        --port 9560
+        --server-bin $<TARGET_FILE:test_uwebsockets_https_server>
+        --client-bin $<TARGET_FILE:test_asio_https_client>)
+  endif()
+
   set_tests_properties(
     test_asio_https_roundtrip
     test_asio_https_asn1_roundtrip
     test_asio_https_rsa_asn1_roundtrip
     test_asio_https_chain_memory_roundtrip
     PROPERTIES TIMEOUT 60)
+
+  if(TEST test_uwebsockets_https_roundtrip)
+    set_tests_properties(test_uwebsockets_https_roundtrip PROPERTIES TIMEOUT 60)
+  endif()
 endif()
 if(NOT OPENSSL_SHIM_EFFECTIVE_BACKEND STREQUAL "SCHANNEL")
   if(CMAKE_CONFIGURATION_TYPES)

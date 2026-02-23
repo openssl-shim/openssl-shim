@@ -223,10 +223,6 @@ struct x509_store_st {
   stack_st_X509_OBJECT object_cache;
 };
 
-struct bio_method_st {
-  int kind;
-};
-
 enum class BioKind { Socket, Memory, Pair };
 
 struct bio_st {
@@ -1492,6 +1488,8 @@ int BIO_new_bio_pair(BIO** bio1, size_t /*writebuf1*/, BIO** bio2, size_t /*writ
   b->kind = BioKind::Pair;
   a->pair = b;
   b->pair = a;
+  openssl_shim::bio_set_method(a, nullptr);
+  openssl_shim::bio_set_method(b, nullptr);
   *bio1 = a;
   *bio2 = b;
   return 1;
@@ -1499,6 +1497,9 @@ int BIO_new_bio_pair(BIO** bio1, size_t /*writebuf1*/, BIO** bio2, size_t /*writ
 
 int BIO_read(BIO* bio, void* data, int len) {
   if (!bio || !data || len <= 0) return -1;
+
+  int custom = 0;
+  if (openssl_shim::bio_dispatch_read(bio, data, len, custom)) return custom;
 
   if (bio->kind == BioKind::Memory || bio->kind == BioKind::Pair) {
     if (bio_pending_bytes(bio) == 0) return 0;
@@ -1518,6 +1519,9 @@ int BIO_read(BIO* bio, void* data, int len) {
 
 int BIO_write(BIO* bio, const void* data, int len) {
   if (!bio || !data || len <= 0) return -1;
+
+  int custom = 0;
+  if (openssl_shim::bio_dispatch_write(bio, data, len, custom)) return custom;
 
   if (bio->kind == BioKind::Pair) {
     if (!bio->pair) return -1;
@@ -1557,6 +1561,7 @@ long BIO_get_mem_data(BIO* bio, char** pp) {
 
 int BIO_free(BIO* a) {
   if (!a) return 0;
+  if (!openssl_shim::bio_should_delete(a)) return 1;
   if (a->kind == BioKind::Socket && a->close_on_free && a->fd >= 0) {
     close_socket_fd(a->fd);
   }

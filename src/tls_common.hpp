@@ -1,5 +1,6 @@
 #pragma once
 
+#include "openssl/bio.h"
 #include "openssl/err.h"
 #include "openssl/x509.h"
 
@@ -67,6 +68,14 @@ struct ssl_method_st {
   int endpoint = 0; // 0 client, 1 server
 };
 
+struct bio_method_st {
+  int type = BIO_TYPE_MEM;
+  int (*create)(BIO*) = nullptr;
+  int (*write)(BIO*, const char*, int) = nullptr;
+  int (*read)(BIO*, char*, int) = nullptr;
+  long (*ctrl)(BIO*, int, long, void*) = nullptr;
+};
+
 namespace openssl_shim {
 
 void set_last_error(unsigned long code, const std::string& message);
@@ -82,6 +91,19 @@ std::string read_file_text(const char* path);
 bool ip_bytes_match_host(const unsigned char* data, size_t len, const std::string& host);
 void clear_ssl_app_data(const ssl_st* ssl);
 void clear_ssl_ctx_app_data(const ssl_ctx_st* ctx);
+
+void bio_set_method(BIO* bio, const BIO_METHOD* method);
+const BIO_METHOD* bio_get_method(const BIO* bio);
+void bio_set_data(BIO* bio, void* data);
+void* bio_get_data(BIO* bio);
+void bio_set_init(BIO* bio, int init);
+int bio_get_init(BIO* bio);
+void bio_set_flags(BIO* bio, int flags);
+int bio_get_flags(BIO* bio);
+int bio_up_ref(BIO* bio);
+bool bio_should_delete(BIO* bio);
+bool bio_dispatch_read(BIO* bio, void* data, int len, int& out);
+bool bio_dispatch_write(BIO* bio, const void* data, int len, int& out);
 
 std::string trim(std::string s);
 std::string normalize(std::string s);

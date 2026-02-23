@@ -4,12 +4,14 @@
 #include "openssl/err.h"
 #include "openssl/evp.h"
 #include "openssl/pem.h"
+#include "openssl/dh.h"
 #include "openssl/ssl.h"
 #include "openssl/x509.h"
 
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -37,9 +39,26 @@ thread_local std::string g_last_error_message;
 thread_local unsigned long g_last_popped_error_code = 0;
 thread_local std::string g_last_popped_error_message;
 
+struct BioState {
+  const BIO_METHOD* method = nullptr;
+  void* data = nullptr;
+  int init = 0;
+  int flags = 0;
+  int refs = 1;
+};
+
 std::mutex g_app_data_mutex;
 std::unordered_map<const SSL*, void*> g_ssl_app_data;
 std::unordered_map<const SSL_CTX*, void*> g_ssl_ctx_app_data;
+std::unordered_map<const SSL*, std::unordered_map<int, void*>> g_ssl_ex_data;
+std::unordered_map<const SSL_CTX*, std::unordered_map<int, void*>> g_ssl_ctx_ex_data;
+std::unordered_map<const SSL_CTX*, SSL_tlsext_servername_callback> g_ctx_sni_callbacks;
+std::unordered_map<const SSL_CTX*, void*> g_ctx_sni_args;
+std::unordered_map<const SSL_CTX*, SSL_CTX_alpn_select_cb_func> g_ctx_alpn_select_callbacks;
+std::unordered_map<const SSL_CTX*, void*> g_ctx_alpn_select_args;
+
+std::mutex g_bio_mutex;
+std::unordered_map<const BIO*, BioState> g_bio_state;
 } // namespace
 
 namespace openssl_shim {
@@ -109,13 +128,121 @@ bool ip_bytes_match_host(const unsigned char* data, size_t len, const std::strin
 void clear_ssl_app_data(const ssl_st* ssl) {
   if (!ssl) return;
   std::lock_guard<std::mutex> lock(g_app_data_mutex);
-  g_ssl_app_data.erase(reinterpret_cast<const SSL*>(ssl));
+  auto* s = reinterpret_cast<const SSL*>(ssl);
+  g_ssl_app_data.erase(s);
+  g_ssl_ex_data.erase(s);
 }
 
 void clear_ssl_ctx_app_data(const ssl_ctx_st* ctx) {
   if (!ctx) return;
   std::lock_guard<std::mutex> lock(g_app_data_mutex);
-  g_ssl_ctx_app_data.erase(reinterpret_cast<const SSL_CTX*>(ctx));
+  auto* c = reinterpret_cast<const SSL_CTX*>(ctx);
+  g_ssl_ctx_app_data.erase(c);
+  g_ssl_ctx_ex_data.erase(c);
+  g_ctx_sni_callbacks.erase(c);
+  g_ctx_sni_args.erase(c);
+  g_ctx_alpn_select_callbacks.erase(c);
+  g_ctx_alpn_select_args.erase(c);
+}
+
+void bio_set_method(BIO* bio, const BIO_METHOD* method) {
+  if (!bio) return;
+  std::lock_guard<std::mutex> lock(g_bio_mutex);
+  auto& st = g_bio_state[bio];
+  st.method = method;
+}
+
+const BIO_METHOD* bio_get_method(const BIO* bio) {
+  if (!bio) return nullptr;
+  std::lock_guard<std::mutex> lock(g_bio_mutex);
+  auto it = g_bio_state.find(bio);
+  return it == g_bio_state.end() ? nullptr : it->second.method;
+}
+
+void bio_set_data(BIO* bio, void* data) {
+  if (!bio) return;
+  std::lock_guard<std::mutex> lock(g_bio_mutex);
+  auto& st = g_bio_state[bio];
+  st.data = data;
+}
+
+void* bio_get_data(BIO* bio) {
+  if (!bio) return nullptr;
+  std::lock_guard<std::mutex> lock(g_bio_mutex);
+  auto it = g_bio_state.find(bio);
+  return it == g_bio_state.end() ? nullptr : it->second.data;
+}
+
+void bio_set_init(BIO* bio, int init) {
+  if (!bio) return;
+  std::lock_guard<std::mutex> lock(g_bio_mutex);
+  auto& st = g_bio_state[bio];
+  st.init = init;
+}
+
+int bio_get_init(BIO* bio) {
+  if (!bio) return 0;
+  std::lock_guard<std::mutex> lock(g_bio_mutex);
+  auto it = g_bio_state.find(bio);
+  return it == g_bio_state.end() ? 0 : it->second.init;
+}
+
+void bio_set_flags(BIO* bio, int flags) {
+  if (!bio) return;
+  std::lock_guard<std::mutex> lock(g_bio_mutex);
+  auto& st = g_bio_state[bio];
+  st.flags |= flags;
+}
+
+int bio_get_flags(BIO* bio) {
+  if (!bio) return 0;
+  std::lock_guard<std::mutex> lock(g_bio_mutex);
+  auto it = g_bio_state.find(bio);
+  return it == g_bio_state.end() ? 0 : it->second.flags;
+}
+
+int bio_up_ref(BIO* bio) {
+  if (!bio) return 0;
+  std::lock_guard<std::mutex> lock(g_bio_mutex);
+  auto& st = g_bio_state[bio];
+  st.refs++;
+  return 1;
+}
+
+bool bio_should_delete(BIO* bio) {
+  if (!bio) return false;
+  std::lock_guard<std::mutex> lock(g_bio_mutex);
+  auto it = g_bio_state.find(bio);
+  if (it == g_bio_state.end()) return true;
+  if (--it->second.refs > 0) return false;
+  g_bio_state.erase(it);
+  return true;
+}
+
+bool bio_dispatch_read(BIO* bio, void* data, int len, int& out) {
+  if (!bio || !data || len <= 0) return false;
+  const BIO_METHOD* method = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_bio_mutex);
+    auto it = g_bio_state.find(bio);
+    if (it == g_bio_state.end() || !it->second.method || !it->second.method->read) return false;
+    method = it->second.method;
+  }
+  out = method->read(bio, static_cast<char*>(data), len);
+  return true;
+}
+
+bool bio_dispatch_write(BIO* bio, const void* data, int len, int& out) {
+  if (!bio || !data || len <= 0) return false;
+  const BIO_METHOD* method = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_bio_mutex);
+    auto it = g_bio_state.find(bio);
+    if (it == g_bio_state.end() || !it->second.method || !it->second.method->write) return false;
+    method = it->second.method;
+  }
+  out = method->write(bio, static_cast<const char*>(data), len);
+  return true;
 }
 
 std::string trim(std::string s) {
@@ -248,6 +375,17 @@ const char* ERR_reason_error_string(unsigned long e) {
   return buf.data();
 }
 
+void ERR_print_errors_fp(FILE* fp) {
+  if (!fp) return;
+  unsigned long e = 0;
+  while ((e = ERR_get_error()) != 0) {
+    char buf[256] = {0};
+    ERR_error_string_n(e, buf, sizeof(buf));
+    std::fputs(buf, fp);
+    std::fputc('\n', fp);
+  }
+}
+
 void ERR_clear_error(void) { openssl_shim::set_last_error(0, {}); }
 
 int OPENSSL_init_ssl(uint64_t /*opts*/, const void* /*settings*/) { return 1; }
@@ -255,6 +393,53 @@ int OPENSSL_init_ssl(uint64_t /*opts*/, const void* /*settings*/) { return 1; }
 int OpenSSL_add_ssl_algorithms(void) { return 1; }
 
 int SSL_load_error_strings(void) { return 1; }
+
+BIO_METHOD* BIO_meth_new(int type, const char* /*name*/) {
+  auto* m = new BIO_METHOD();
+  m->type = type;
+  return m;
+}
+
+void BIO_meth_free(BIO_METHOD* biom) {
+  if (!biom || biom == BIO_s_mem()) return;
+  delete biom;
+}
+
+int BIO_meth_set_create(BIO_METHOD* biom, int (*create)(BIO*)) {
+  if (!biom) return 0;
+  biom->create = create;
+  return 1;
+}
+
+int BIO_meth_set_write(BIO_METHOD* biom, int (*write)(BIO*, const char*, int)) {
+  if (!biom) return 0;
+  biom->write = write;
+  return 1;
+}
+
+int BIO_meth_set_read(BIO_METHOD* biom, int (*read)(BIO*, char*, int)) {
+  if (!biom) return 0;
+  biom->read = read;
+  return 1;
+}
+
+int BIO_meth_set_ctrl(BIO_METHOD* biom, long (*ctrl)(BIO*, int, long, void*)) {
+  if (!biom) return 0;
+  biom->ctrl = ctrl;
+  return 1;
+}
+
+void BIO_set_data(BIO* bio, void* data) { openssl_shim::bio_set_data(bio, data); }
+
+void* BIO_get_data(BIO* bio) { return openssl_shim::bio_get_data(bio); }
+
+void BIO_set_init(BIO* bio, int init) { openssl_shim::bio_set_init(bio, init); }
+
+int BIO_get_init(BIO* bio) { return openssl_shim::bio_get_init(bio); }
+
+void BIO_set_flags(BIO* bio, int flags) { openssl_shim::bio_set_flags(bio, flags); }
+
+int BIO_up_ref(BIO* bio) { return openssl_shim::bio_up_ref(bio); }
 
 const unsigned char* ASN1_STRING_get0_data(const ASN1_STRING* x) {
   if (!x || x->bytes.empty()) return nullptr;
@@ -493,6 +678,15 @@ STACK_OF_X509_INFO* PEM_X509_INFO_read_bio(BIO* bp, STACK_OF_X509_INFO* sk,
   return sk;
 }
 
+DH* PEM_read_DHparams(FILE* fp, DH** x, pem_password_cb* /*cb*/, void* /*u*/) {
+  if (!fp) return nullptr;
+  auto* out = new DH();
+  if (x) *x = out;
+  return out;
+}
+
+void DH_free(DH* dh) { delete dh; }
+
 const SSL_METHOD* TLS_client_method(void) {
   static const ssl_method_st method{0};
   return &method;
@@ -519,6 +713,28 @@ int SSL_set_ecdh_auto(SSL* /*ssl*/, int /*onoff*/) { return 1; }
 
 int SSL_get_ex_data_X509_STORE_CTX_idx(void) { return 0; }
 
+long SSL_CTX_set_read_ahead(SSL_CTX* /*ctx*/, int m) { return m ? 1 : 0; }
+
+int SSL_CTX_set_tmp_dh(SSL_CTX* /*ctx*/, DH* /*dh*/) { return 1; }
+
+int SSL_read_ex(SSL* ssl, void* buf, size_t num, size_t* readbytes) {
+  if (readbytes) *readbytes = 0;
+  if (!ssl || !buf) return 0;
+  int rc = SSL_read(ssl, buf, static_cast<int>(num));
+  if (rc <= 0) return 0;
+  if (readbytes) *readbytes = static_cast<size_t>(rc);
+  return 1;
+}
+
+int SSL_write_ex(SSL* ssl, const void* buf, size_t num, size_t* written) {
+  if (written) *written = 0;
+  if (!ssl || !buf) return 0;
+  int rc = SSL_write(ssl, buf, static_cast<int>(num));
+  if (rc <= 0) return 0;
+  if (written) *written = static_cast<size_t>(rc);
+  return 1;
+}
+
 void SSL_set_app_data(SSL* ssl, void* arg) {
   if (!ssl) return;
   std::lock_guard<std::mutex> lock(g_app_data_mutex);
@@ -534,6 +750,22 @@ void* SSL_get_app_data(const SSL* ssl) {
   std::lock_guard<std::mutex> lock(g_app_data_mutex);
   auto it = g_ssl_app_data.find(ssl);
   return it == g_ssl_app_data.end() ? nullptr : it->second;
+}
+
+int SSL_set_ex_data(SSL* ssl, int idx, void* data) {
+  if (!ssl || idx < 0) return 0;
+  std::lock_guard<std::mutex> lock(g_app_data_mutex);
+  g_ssl_ex_data[ssl][idx] = data;
+  return 1;
+}
+
+void* SSL_get_ex_data(const SSL* ssl, int idx) {
+  if (!ssl || idx < 0) return nullptr;
+  std::lock_guard<std::mutex> lock(g_app_data_mutex);
+  auto sit = g_ssl_ex_data.find(ssl);
+  if (sit == g_ssl_ex_data.end()) return nullptr;
+  auto it = sit->second.find(idx);
+  return it == sit->second.end() ? nullptr : it->second;
 }
 
 void SSL_CTX_set_app_data(SSL_CTX* ctx, void* arg) {
@@ -553,5 +785,48 @@ void* SSL_CTX_get_app_data(const SSL_CTX* ctx) {
   return it == g_ssl_ctx_app_data.end() ? nullptr : it->second;
 }
 
+int SSL_CTX_set_ex_data(SSL_CTX* ctx, int idx, void* data) {
+  if (!ctx || idx < 0) return 0;
+  std::lock_guard<std::mutex> lock(g_app_data_mutex);
+  g_ssl_ctx_ex_data[ctx][idx] = data;
+  return 1;
+}
+
+void* SSL_CTX_get_ex_data(const SSL_CTX* ctx, int idx) {
+  if (!ctx || idx < 0) return nullptr;
+  std::lock_guard<std::mutex> lock(g_app_data_mutex);
+  auto sit = g_ssl_ctx_ex_data.find(ctx);
+  if (sit == g_ssl_ctx_ex_data.end()) return nullptr;
+  auto it = sit->second.find(idx);
+  return it == sit->second.end() ? nullptr : it->second;
+}
+
+long SSL_CTX_set_tlsext_servername_callback(SSL_CTX* ctx, SSL_tlsext_servername_callback cb) {
+  if (!ctx) return 0;
+  std::lock_guard<std::mutex> lock(g_app_data_mutex);
+  if (cb)
+    g_ctx_sni_callbacks[ctx] = cb;
+  else
+    g_ctx_sni_callbacks.erase(ctx);
+  return 1;
+}
+
+long SSL_CTX_set_tlsext_servername_arg(SSL_CTX* ctx, void* arg) {
+  if (!ctx) return 0;
+  std::lock_guard<std::mutex> lock(g_app_data_mutex);
+  g_ctx_sni_args[ctx] = arg;
+  return 1;
+}
+
+int SSL_CTX_set_alpn_select_cb(SSL_CTX* ctx, SSL_CTX_alpn_select_cb_func cb, void* arg) {
+  if (!ctx) return 0;
+  std::lock_guard<std::mutex> lock(g_app_data_mutex);
+  if (cb)
+    g_ctx_alpn_select_callbacks[ctx] = cb;
+  else
+    g_ctx_alpn_select_callbacks.erase(ctx);
+  g_ctx_alpn_select_args[ctx] = arg;
+  return 1;
+}
 
 } // extern "C"

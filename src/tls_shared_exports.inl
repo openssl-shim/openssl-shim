@@ -3,6 +3,7 @@ BIO* BIO_new_socket(int sock, int close_flag) {
   bio->kind = BioKind::Socket;
   bio->fd = sock;
   bio->close_on_free = close_flag != BIO_NOCLOSE;
+  openssl_shim::bio_set_method(bio, nullptr);
   return bio;
 }
 
@@ -22,12 +23,20 @@ BIO* BIO_new_mem_buf(const void* buf, int len) {
     bio->data.assign(static_cast<const unsigned char*>(buf),
                      static_cast<const unsigned char*>(buf) + len);
   }
+  openssl_shim::bio_set_method(bio, &g_mem_method);
   return bio;
 }
 
 BIO* BIO_new(const BIO_METHOD* method) {
-  if (!method || method != &g_mem_method) return nullptr;
-  return BIO_new_mem_buf(nullptr, 0);
+  if (!method) return nullptr;
+  auto* bio = BIO_new_mem_buf(nullptr, 0);
+  if (!bio) return nullptr;
+  openssl_shim::bio_set_method(bio, method);
+  if (method->create && method->create(bio) != 1) {
+    BIO_free(bio);
+    return nullptr;
+  }
+  return bio;
 }
 
 BIO* BIO_new_file(const char* filename, const char* mode) {
@@ -209,9 +218,33 @@ long SSL_ctrl(SSL* ssl, int cmd, long larg, void* parg) {
   return 0;
 }
 
+void SSL_set_connect_state(SSL* ssl) {
+  if (!ssl || !ssl->ctx) return;
+  ssl->ctx->is_client = true;
+}
+
+void SSL_set_accept_state(SSL* ssl) {
+  if (!ssl || !ssl->ctx) return;
+  ssl->ctx->is_client = false;
+}
+
+int SSL_in_init(const SSL* /*ssl*/) { return 0; }
+
+SSL_CTX* SSL_set_SSL_CTX(SSL* ssl, SSL_CTX* ctx) {
+  if (!ssl) return nullptr;
+  SSL_CTX* old = ssl->ctx;
+  ssl->ctx = ctx;
+  return old;
+}
+
 int SSL_get_error(const SSL* ssl, int /*ret*/) {
   if (!ssl) return SSL_ERROR_SSL;
   return ssl->last_error;
+}
+
+void SSL_set_shutdown(SSL* ssl, int mode) {
+  if (!ssl) return;
+  ssl->shutdown_state = mode;
 }
 
 X509* SSL_get1_peer_certificate(const SSL* ssl) { return SSL_get_peer_certificate(ssl); }

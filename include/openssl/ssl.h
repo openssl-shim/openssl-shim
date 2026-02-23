@@ -20,6 +20,11 @@ typedef struct ssl_session_st SSL_SESSION;
 typedef struct evp_pkey_st EVP_PKEY;
 
 typedef int pem_password_cb(char* buf, int size, int rwflag, void* userdata);
+typedef int (*SSL_tlsext_servername_callback)(SSL* ssl, int* al, void* arg);
+typedef int (*SSL_CTX_alpn_select_cb_func)(SSL* ssl, const unsigned char** out,
+                                            unsigned char* outlen,
+                                            const unsigned char* in,
+                                            unsigned int inlen, void* arg);
 
 /* OpenSSL compatibility constants */
 #define SSL_ERROR_NONE           0
@@ -61,6 +66,11 @@ typedef int pem_password_cb(char* buf, int size, int rwflag, void* userdata);
 
 #define SSL_CTRL_SET_TLSEXT_HOSTNAME 55
 #define TLSEXT_NAMETYPE_host_name 0
+
+#define SSL_TLSEXT_ERR_OK 0
+#define SSL_TLSEXT_ERR_ALERT_WARNING 1
+#define SSL_TLSEXT_ERR_ALERT_FATAL 2
+#define SSL_TLSEXT_ERR_NOACK 3
 
 #define SSL_SENT_SHUTDOWN     0x01
 #define SSL_RECEIVED_SHUTDOWN 0x02
@@ -115,6 +125,7 @@ long SSL_CTX_clear_mode(SSL_CTX* ctx, long mode);
 long SSL_CTX_set_options(SSL_CTX* ctx, long options);
 long SSL_CTX_clear_options(SSL_CTX* ctx, long options);
 int  SSL_CTX_set_session_cache_mode(SSL_CTX* ctx, int mode);
+long SSL_CTX_set_read_ahead(SSL_CTX* ctx, int m);
 int  SSL_CTX_set_cipher_list(SSL_CTX* ctx, const char* str);
 int  SSL_CTX_set_ciphersuites(SSL_CTX* ctx, const char* str);
 int  SSL_CTX_load_verify_locations(SSL_CTX* ctx, const char* ca_file, const char* ca_path);
@@ -139,9 +150,16 @@ int  SSL_CTX_set_alpn_protos(SSL_CTX* ctx, const unsigned char* protos, unsigned
 int  SSL_CTX_add_extra_chain_cert(SSL_CTX* ctx, X509* x509);
 void SSL_CTX_clear_chain_certs(SSL_CTX* ctx);
 int  SSL_CTX_set0_tmp_dh_pkey(SSL_CTX* ctx, EVP_PKEY* pkey);
+int  SSL_CTX_set_tmp_dh(SSL_CTX* ctx, struct dh_st* dh);
 
 void  SSL_CTX_set_app_data(SSL_CTX* ctx, void* arg);
 void* SSL_CTX_get_app_data(const SSL_CTX* ctx);
+int   SSL_CTX_set_ex_data(SSL_CTX* ctx, int idx, void* data);
+void* SSL_CTX_get_ex_data(const SSL_CTX* ctx, int idx);
+
+long SSL_CTX_set_tlsext_servername_callback(SSL_CTX* ctx, SSL_tlsext_servername_callback cb);
+long SSL_CTX_set_tlsext_servername_arg(SSL_CTX* ctx, void* arg);
+int  SSL_CTX_set_alpn_select_cb(SSL_CTX* ctx, SSL_CTX_alpn_select_cb_func cb, void* arg);
 
 /* SSL lifecycle */
 SSL* SSL_new(SSL_CTX* ctx);
@@ -151,6 +169,10 @@ void SSL_set_bio(SSL* ssl, BIO* rbio, BIO* wbio);
 BIO* SSL_get_rbio(const SSL* ssl);
 int  SSL_set_tlsext_host_name(SSL* ssl, const char* name);
 long SSL_ctrl(SSL* ssl, int cmd, long larg, void* parg);
+void SSL_set_connect_state(SSL* ssl);
+void SSL_set_accept_state(SSL* ssl);
+int  SSL_in_init(const SSL* ssl);
+SSL_CTX* SSL_set_SSL_CTX(SSL* ssl, SSL_CTX* ctx);
 void SSL_set_verify(SSL* ssl, int mode,
                     int (*verify_callback)(int, X509_STORE_CTX*));
 int  SSL_get_verify_mode(const SSL* ssl);
@@ -161,6 +183,8 @@ void SSL_clear_mode(SSL* ssl, long mode);
 int  SSL_set_ecdh_auto(SSL* ssl, int onoff);
 void SSL_set_app_data(SSL* ssl, void* arg);
 void* SSL_get_app_data(const SSL* ssl);
+int   SSL_set_ex_data(SSL* ssl, int idx, void* data);
+void* SSL_get_ex_data(const SSL* ssl, int idx);
 SSL_CTX* SSL_get_SSL_CTX(const SSL* ssl);
 
 /* Handshake / I/O */
@@ -171,8 +195,11 @@ int SSL_write(SSL* ssl, const void* buf, int num);
 int SSL_peek(SSL* ssl, void* buf, int num);
 int SSL_pending(const SSL* ssl);
 int SSL_shutdown(SSL* ssl);
+void SSL_set_shutdown(SSL* ssl, int mode);
 int SSL_get_shutdown(const SSL* ssl);
 int SSL_get_error(const SSL* ssl, int ret);
+int SSL_read_ex(SSL* ssl, void* buf, size_t num, size_t* readbytes);
+int SSL_write_ex(SSL* ssl, const void* buf, size_t num, size_t* written);
 
 /* Cert/verify */
 X509* SSL_get_peer_certificate(const SSL* ssl);

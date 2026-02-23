@@ -7,3 +7,7 @@
 [submodule "test/asio"]
 	path = test/asio
 	url = https://github.com/chriskohlhoff/asio.git
+[submodule "test/uWebSockets"]
+	path = test/uWebSockets
+	url = https://github.com/uNetworking/uWebSockets
+	shallow = true

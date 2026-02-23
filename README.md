@@ -21,6 +21,12 @@ compatibility with all OpenSSL features.
 - `IXWebSocket`
 - standalone `Asio` SSL usage (runtime HTTPS roundtrip coverage)
 
+## In-progress expansion targets
+
+- `uWebSockets` / `uSockets`
+  - submodule + non-Windows HTTPS harness are wired in `test/`
+  - not yet counted as fully supported until CI matrix coverage is enabled
+
 ## Integration model (easy by default)
 
 `openssl-shim` supports three first-class consumption modes:
@@ -141,6 +147,7 @@ Integration tests are in `test/` and use direct `add_subdirectory` of:
 
 - `test/cpp-httplib`
 - `test/IXWebSocket`
+- `test/uWebSockets` (P1 in-progress; non-Windows harness)
 
 with `CPPHTTPLIB_OPENSSL_SUPPORT` and `IXWEBSOCKET_USE_OPEN_SSL` active.
 
@@ -169,6 +176,7 @@ Current test set covers:
 - IXWebSocket mTLS (client cert required)
 - TLS 1.3-only interop runner (all non-Schannel backends)
 - standalone Asio HTTPS roundtrip runner
+- uWebSockets local HTTPS roundtrip runner (non-Windows, P1 in progress)
 
 ## Cipher suites
 

@@ -3,6 +3,17 @@
 #include <stddef.h>
 #include <time.h>
 
+/* Avoid WinCrypt macro collisions when windows.h is included first. */
+#ifdef X509_NAME
+#undef X509_NAME
+#endif
+#ifdef X509_CERT_PAIR
+#undef X509_CERT_PAIR
+#endif
+#ifdef X509_EXTENSIONS
+#undef X509_EXTENSIONS
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif

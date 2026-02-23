@@ -40,7 +40,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: false
+
+      - name: Initialize required submodules
+        shell: bash
+        run: |
+          git submodule sync --recursive
+          git submodule update --init --depth 1 \
+            test/cpp-httplib \
+            test/IXWebSocket \
+            test/asio \
+            test/uWebSockets
+          git -C test/uWebSockets submodule update --init --depth 1 uSockets
 
       - name: Resolve Python executable for CMake
         shell: bash
@@ -53,7 +64,7 @@ jobs:
         run: >-
           cmake -S . -B build
           -DPython3_EXECUTABLE=${{ env.PYTHON_FOR_CMAKE }}
-          -DNATIVE_TLS_SHIM_NATIVE_BACKEND=${{ matrix.native_backend }}
+          -DOPENSSL_SHIM_NATIVE_BACKEND=${{ matrix.native_backend }}
           -DCMAKE_BUILD_TYPE=Debug
 
       - name: Build

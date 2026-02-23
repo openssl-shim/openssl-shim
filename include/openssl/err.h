@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -29,6 +30,7 @@ void          ERR_error_string_n(unsigned long e, char* buf, size_t len);
 char*         ERR_error_string(unsigned long e, char* buf);
 const char*   ERR_lib_error_string(unsigned long e);
 const char*   ERR_reason_error_string(unsigned long e);
+void          ERR_print_errors_fp(FILE* fp);
 void          ERR_clear_error(void);
 
 #ifdef __cplusplus
