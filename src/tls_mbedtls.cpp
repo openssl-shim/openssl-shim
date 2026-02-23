@@ -61,15 +61,15 @@
 #include <unistd.h>
 #endif
 
-using native_tls::clear_error_message;
-using native_tls::close_socket_fd;
-using native_tls::extract_dn_component;
-using native_tls::ip_bytes_match_host;
-using native_tls::is_ip_literal;
-using native_tls::set_error_message;
-using native_tls::set_fd_nonblocking;
-using native_tls::trim;
-using native_tls::wildcard_match;
+using openssl_shim::clear_error_message;
+using openssl_shim::close_socket_fd;
+using openssl_shim::extract_dn_component;
+using openssl_shim::ip_bytes_match_host;
+using openssl_shim::is_ip_literal;
+using openssl_shim::set_error_message;
+using openssl_shim::set_fd_nonblocking;
+using openssl_shim::trim;
+using openssl_shim::wildcard_match;
 
 #ifdef _WIN32
 using socket_len_t = int;
@@ -489,7 +489,7 @@ bool setup_ssl_context(SSL_CTX* ctx) {
   std::call_once(g_psa_init_once, []() { psa_crypto_init(); });
 #endif
 
-  const char* pers = "native_tls_shim";
+  const char* pers = "openssl_shim";
   int rc = mbedtls_ctr_drbg_seed(&ctx->ctr_drbg, mbedtls_entropy_func, &ctx->entropy,
                                  reinterpret_cast<const unsigned char*>(pers),
                                  std::strlen(pers));
@@ -1166,7 +1166,7 @@ static bool parse_cipher_list_string(const char* str, std::vector<int>& out) {
   std::string token;
   auto flush = [&]() {
     if (token.empty()) return;
-    std::string normalized = native_tls::normalize(token);
+    std::string normalized = openssl_shim::normalize(token);
     token.clear();
     if (normalized.empty()) return;
     if (normalized[0] == '!') return;
@@ -1390,7 +1390,7 @@ void SSL_CTX_clear_chain_certs(SSL_CTX* /*ctx*/) {}
 
 int SSL_CTX_set0_tmp_dh_pkey(SSL_CTX* /*ctx*/, EVP_PKEY* pkey) {
   if (pkey) EVP_PKEY_free(pkey);
-  set_error_message("SSL_CTX_set0_tmp_dh_pkey is not implemented by native-tls-shim",
+  set_error_message("SSL_CTX_set0_tmp_dh_pkey is not implemented by openssl-shim",
                     1, ERR_LIB_SSL);
   return 0;
 }

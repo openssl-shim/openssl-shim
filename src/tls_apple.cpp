@@ -42,16 +42,16 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-using native_tls::clear_error_message;
-using native_tls::close_socket_fd;
-using native_tls::extract_dn_component;
-using native_tls::ip_bytes_match_host;
-using native_tls::is_ip_literal;
-using native_tls::read_file_text;
-using native_tls::set_error_message;
-using native_tls::set_fd_nonblocking;
-using native_tls::trim;
-using native_tls::wildcard_match;
+using openssl_shim::clear_error_message;
+using openssl_shim::close_socket_fd;
+using openssl_shim::extract_dn_component;
+using openssl_shim::ip_bytes_match_host;
+using openssl_shim::is_ip_literal;
+using openssl_shim::read_file_text;
+using openssl_shim::set_error_message;
+using openssl_shim::set_fd_nonblocking;
+using openssl_shim::trim;
+using openssl_shim::wildcard_match;
 
 using socket_len_t = socklen_t;
 
@@ -191,7 +191,7 @@ std::string make_temp_keychain_path() {
   }
   if (dir.empty()) dir = "/tmp";
 
-  std::string tmpl = dir + "/native_tls_shim_keychain_XXXXXX";
+  std::string tmpl = dir + "/openssl_shim_keychain_XXXXXX";
   std::vector<char> path(tmpl.begin(), tmpl.end());
   path.push_back('\0');
   int fd = mkstemp(path.data());
@@ -1945,7 +1945,7 @@ static bool parse_cipher_list_string(const char* str,
   std::string token;
   auto flush = [&]() {
     if (token.empty()) return;
-    std::string normalized = native_tls::normalize(token);
+    std::string normalized = openssl_shim::normalize(token);
     token.clear();
     if (normalized.empty()) return;
     if (normalized[0] == '!') return;

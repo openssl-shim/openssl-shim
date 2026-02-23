@@ -1,6 +1,6 @@
 include(FetchContent)
 
-function(native_tls_shim_reset_openssl_find_state)
+function(openssl_shim_reset_openssl_find_state)
   foreach(_var
       OPENSSL_FOUND OpenSSL_FOUND
       OPENSSL_VERSION OpenSSL_VERSION
@@ -23,7 +23,7 @@ set(HTTPLIB_USE_ZSTD_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
 set(HTTPLIB_TEST OFF CACHE BOOL "" FORCE)
 set(HTTPLIB_INSTALL OFF CACHE BOOL "" FORCE)
 
-native_tls_shim_reset_openssl_find_state()
+openssl_shim_reset_openssl_find_state()
 
 if(EXISTS "${_cpp_httplib_dir}/CMakeLists.txt")
   add_subdirectory("${_cpp_httplib_dir}" "${CMAKE_CURRENT_BINARY_DIR}/cpp-httplib" SYSTEM)
@@ -45,7 +45,7 @@ set(BUILD_DEMO OFF CACHE BOOL "" FORCE)
 set(IXWEBSOCKET_INSTALL OFF CACHE BOOL "" FORCE)
 # Let IXWebSocket resolve OpenSSL via find_package(OpenSSL), which is provided
 # by this shim's FindOpenSSL/OpenSSLConfig logic.
-native_tls_shim_reset_openssl_find_state()
+openssl_shim_reset_openssl_find_state()
 
 if(EXISTS "${_ixws_dir}/CMakeLists.txt")
   add_subdirectory("${_ixws_dir}" "${CMAKE_CURRENT_BINARY_DIR}/IXWebSocket" SYSTEM)
@@ -236,7 +236,7 @@ if(EXISTS "${_asio_include_dir}/asio.hpp")
     test_asio_https_chain_memory_roundtrip
     PROPERTIES TIMEOUT 60)
 endif()
-if(NOT NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "SCHANNEL")
+if(NOT OPENSSL_SHIM_EFFECTIVE_BACKEND STREQUAL "SCHANNEL")
   if(CMAKE_CONFIGURATION_TYPES)
     add_test(NAME test_tls13_only
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/run_tls13_only_test.py

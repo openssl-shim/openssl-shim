@@ -42,7 +42,7 @@ std::unordered_map<const SSL*, void*> g_ssl_app_data;
 std::unordered_map<const SSL_CTX*, void*> g_ssl_ctx_app_data;
 } // namespace
 
-namespace native_tls {
+namespace openssl_shim {
 
 void set_last_error(unsigned long code, const std::string& message) {
   g_last_error_code = code;
@@ -72,7 +72,7 @@ std::string get_last_error_string(unsigned long code) {
   if (!g_last_popped_error_message.empty() && code == g_last_popped_error_code) {
     return g_last_popped_error_message;
   }
-  return "native-tls-shim error: " + std::to_string(code);
+  return "openssl-shim error: " + std::to_string(code);
 }
 
 unsigned long make_error_code(int lib, int reason) {
@@ -189,7 +189,7 @@ bool is_ip_literal(const std::string& s) {
          inet_pton(AF_INET6, s.c_str(), buf.data()) == 1;
 }
 
-} // namespace native_tls
+} // namespace openssl_shim
 
 extern "C" {
 
@@ -205,17 +205,17 @@ void OPENSSL_cleanse(void* ptr, size_t len) {
 
 void OPENSSL_thread_stop(void) {}
 
-unsigned long ERR_get_error(void) { return native_tls::pop_last_error_code(); }
+unsigned long ERR_get_error(void) { return openssl_shim::pop_last_error_code(); }
 
-unsigned long ERR_peek_error(void) { return native_tls::peek_last_error_code(); }
+unsigned long ERR_peek_error(void) { return openssl_shim::peek_last_error_code(); }
 
 unsigned long ERR_peek_last_error(void) {
-  return native_tls::peek_last_error_code();
+  return openssl_shim::peek_last_error_code();
 }
 
 void ERR_error_string_n(unsigned long e, char* buf, size_t len) {
   if (!buf || len == 0) return;
-  auto msg = native_tls::get_last_error_string(e);
+  auto msg = openssl_shim::get_last_error_string(e);
   if (msg.empty()) msg = "ok";
   auto n = std::min(msg.size(), len - 1);
   std::memcpy(buf, msg.data(), n);
@@ -248,7 +248,7 @@ const char* ERR_reason_error_string(unsigned long e) {
   return buf.data();
 }
 
-void ERR_clear_error(void) { native_tls::set_last_error(0, {}); }
+void ERR_clear_error(void) { openssl_shim::set_last_error(0, {}); }
 
 int OPENSSL_init_ssl(uint64_t /*opts*/, const void* /*settings*/) { return 1; }
 

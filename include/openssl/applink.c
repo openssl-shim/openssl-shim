@@ -1,1 +1,1 @@
-/* native-tls-shim: applink not required */
+/* openssl-shim: applink not required */

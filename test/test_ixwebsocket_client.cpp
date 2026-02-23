@@ -22,9 +22,9 @@ static bool try_url(const std::string& url) {
 
   ws.setOnMessageCallback([&](const ix::WebSocketMessagePtr& msg) {
     if (msg->type == ix::WebSocketMessageType::Open) {
-      ws.send("native-tls-shim", false);
+      ws.send("openssl-shim", false);
     } else if (msg->type == ix::WebSocketMessageType::Message) {
-      if (msg->str.find("native-tls-shim") != std::string::npos) {
+      if (msg->str.find("openssl-shim") != std::string::npos) {
         gotEcho = true;
       }
     } else if (msg->type == ix::WebSocketMessageType::Error) {

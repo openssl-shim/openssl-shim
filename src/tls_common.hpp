@@ -67,7 +67,7 @@ struct ssl_method_st {
   int endpoint = 0; // 0 client, 1 server
 };
 
-namespace native_tls {
+namespace openssl_shim {
 
 void set_last_error(unsigned long code, const std::string& message);
 unsigned long peek_last_error_code();
@@ -91,4 +91,4 @@ int close_socket_fd(int fd);
 bool set_fd_nonblocking(int fd, bool on);
 bool is_ip_literal(const std::string& s);
 
-} // namespace native_tls
+} // namespace openssl_shim

@@ -3,7 +3,7 @@
 /*
  * Minimal ENGINE compatibility header.
  *
- * native-tls-shim targets OpenSSL 3.x style code paths and does not expose
+ * openssl-shim targets OpenSSL 3.x style code paths and does not expose
  * legacy ENGINE APIs.
  */
 

@@ -1,4 +1,4 @@
-# native-tls-shim
+# openssl-shim
 
 OpenSSL shim aimed at making **popular C++ HTTPS/TLS libraries** work without linking OpenSSL itself.
 
@@ -23,7 +23,7 @@ compatibility with all OpenSSL features.
 
 ## Integration model (easy by default)
 
-`native-tls-shim` supports three first-class consumption modes:
+`openssl-shim` supports three first-class consumption modes:
 
 1. **`add_subdirectory(...)`** in a mono-repo/superbuild
 2. **`FetchContent`** for source-based dependency management
@@ -42,7 +42,7 @@ In all three modes, consumers use standard OpenSSL CMake targets:
 
 ## Build
 
-`NATIVE_TLS_SHIM_NATIVE_BACKEND` controls backend selection.
+`OPENSSL_SHIM_NATIVE_BACKEND` controls backend selection.
 
 - `ON` (default): uses Schannel on Windows, Apple Security on macOS, and mbedTLS elsewhere.
 - `OFF`: forces mbedTLS on all platforms.
@@ -50,7 +50,7 @@ In all three modes, consumers use standard OpenSSL CMake targets:
 Example native-backend build (default):
 
 ```bash
-cmake -S . -B build -DNATIVE_TLS_SHIM_NATIVE_BACKEND=ON
+cmake -S . -B build -DOPENSSL_SHIM_NATIVE_BACKEND=ON
 cmake --build build
 ```
 
@@ -59,7 +59,7 @@ Library type follows standard CMake behavior via `BUILD_SHARED_LIBS` (default `O
 Example forced-mbedTLS build:
 
 ```bash
-cmake -S . -B build-mbed -DNATIVE_TLS_SHIM_NATIVE_BACKEND=OFF
+cmake -S . -B build-mbed -DOPENSSL_SHIM_NATIVE_BACKEND=OFF
 cmake --build build-mbed
 ```
 
@@ -67,7 +67,7 @@ When mbedTLS is active, the project first tries a system-provided MbedTLS 3.x pa
 and falls back to FetchContent if not found. To always fetch vendored mbedTLS, set:
 
 ```bash
--DNATIVE_TLS_SHIM_ALWAYS_FETCH_MBEDTLS=ON
+-DOPENSSL_SHIM_ALWAYS_FETCH_MBEDTLS=ON
 ```
 
 When this project is the **top-level** CMake project, tests/examples are
@@ -98,10 +98,10 @@ ixwebsocket_example wss://127.0.0.1:9450 test/fixtures/trusted-ca-crt.pem hello
 ## add_subdirectory usage
 
 ```cmake
-add_subdirectory(path/to/native-tls-shim)
+add_subdirectory(path/to/openssl-shim)
 
 # then add dependencies that call find_package(OpenSSL)
-# (native_tls_shim propagates its FindOpenSSL module path)
+# (openssl_shim propagates its FindOpenSSL module path)
 ```
 
 ## FetchContent usage
@@ -109,13 +109,13 @@ add_subdirectory(path/to/native-tls-shim)
 ```cmake
 include(FetchContent)
 
-FetchContent_Declare(native_tls_shim
+FetchContent_Declare(openssl_shim
   GIT_REPOSITORY <this-repo-url>
   GIT_TAG main)
-FetchContent_MakeAvailable(native_tls_shim)
+FetchContent_MakeAvailable(openssl_shim)
 
 # then add dependencies that call find_package(OpenSSL)
-# (native_tls_shim propagates its FindOpenSSL module path)
+# (openssl_shim propagates its FindOpenSSL module path)
 ```
 
 The project defines:
@@ -123,12 +123,12 @@ The project defines:
 - `OpenSSL::SSL`
 - `OpenSSL::Crypto`
 
-both forwarding to `native_tls_shim`.
+both forwarding to `openssl_shim`.
 
 ## Install + find_package(OpenSSL)
 
 ```bash
-cmake -S . -B build -DNATIVE_TLS_SHIM_ENABLE_INSTALL=ON
+cmake -S . -B build -DOPENSSL_SHIM_ENABLE_INSTALL=ON
 cmake --build build --target install
 ```
 

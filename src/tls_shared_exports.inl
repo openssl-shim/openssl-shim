@@ -32,7 +32,7 @@ BIO* BIO_new(const BIO_METHOD* method) {
 
 BIO* BIO_new_file(const char* filename, const char* mode) {
   if (!filename || !mode || std::strchr(mode, 'r') == nullptr) return nullptr;
-  auto bytes = native_tls::read_file_text(filename);
+  auto bytes = openssl_shim::read_file_text(filename);
   if (bytes.empty()) return nullptr;
   return BIO_new_mem_buf(bytes.data(), static_cast<int>(bytes.size()));
 }
@@ -147,7 +147,7 @@ STACK_OF_X509_OBJECT* X509_STORE_get0_objects(const X509_STORE* store) {
 
 void SSL_CTX_free(SSL_CTX* ctx) {
   if (!ctx) return;
-  native_tls::clear_ssl_ctx_app_data(ctx);
+  openssl_shim::clear_ssl_ctx_app_data(ctx);
   delete ctx;
 }
 
@@ -195,7 +195,7 @@ void SSL_CTX_set_client_CA_list(SSL_CTX* ctx, STACK_OF_X509_NAME* list) {
 
 void SSL_free(SSL* ssl) {
   if (!ssl) return;
-  native_tls::clear_ssl_app_data(ssl);
+  openssl_shim::clear_ssl_app_data(ssl);
   delete ssl;
 }
 

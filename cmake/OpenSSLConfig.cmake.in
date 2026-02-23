@@ -1,12 +1,12 @@
 @PACKAGE_INIT@
 
-set(_native_tls_shim_openssl_version "@NATIVE_TLS_SHIM_OPENSSL_VERSION@")
+set(_openssl_shim_openssl_version "@OPENSSL_SHIM_OPENSSL_VERSION@")
 
-# native-tls-shim only models OpenSSL 3.x semantics.
+# openssl-shim only models OpenSSL 3.x semantics.
 if(DEFINED OpenSSL_FIND_VERSION_MAJOR AND OpenSSL_FIND_VERSION_MAJOR LESS 3)
   if(OpenSSL_FIND_REQUIRED)
     message(FATAL_ERROR
-      "native-tls-shim provides OpenSSL ${_native_tls_shim_openssl_version}; "
+      "openssl-shim provides OpenSSL ${_openssl_shim_openssl_version}; "
       "requested OpenSSL ${OpenSSL_FIND_VERSION} is below major version 3")
   endif()
   set(OpenSSL_FOUND FALSE)
@@ -16,20 +16,20 @@ endif()
 
 if(DEFINED OpenSSL_FIND_VERSION)
   if(OpenSSL_FIND_VERSION_EXACT)
-    if(NOT _native_tls_shim_openssl_version VERSION_EQUAL OpenSSL_FIND_VERSION)
+    if(NOT _openssl_shim_openssl_version VERSION_EQUAL OpenSSL_FIND_VERSION)
       if(OpenSSL_FIND_REQUIRED)
         message(FATAL_ERROR
-          "native-tls-shim provides OpenSSL ${_native_tls_shim_openssl_version}; "
+          "openssl-shim provides OpenSSL ${_openssl_shim_openssl_version}; "
           "exact OpenSSL ${OpenSSL_FIND_VERSION} requested")
       endif()
       set(OpenSSL_FOUND FALSE)
       set(OPENSSL_FOUND FALSE)
       return()
     endif()
-  elseif(_native_tls_shim_openssl_version VERSION_LESS OpenSSL_FIND_VERSION)
+  elseif(_openssl_shim_openssl_version VERSION_LESS OpenSSL_FIND_VERSION)
     if(OpenSSL_FIND_REQUIRED)
       message(FATAL_ERROR
-        "native-tls-shim provides OpenSSL ${_native_tls_shim_openssl_version}; "
+        "openssl-shim provides OpenSSL ${_openssl_shim_openssl_version}; "
         "OpenSSL ${OpenSSL_FIND_VERSION} requested")
     endif()
     set(OpenSSL_FOUND FALSE)
@@ -41,16 +41,16 @@ endif()
 get_filename_component(_openssl_prefix "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
 
 include(CMakeFindDependencyMacro)
-if("@NATIVE_TLS_SHIM_EFFECTIVE_BACKEND@" STREQUAL "MBEDTLS")
+if("@OPENSSL_SHIM_EFFECTIVE_BACKEND@" STREQUAL "MBEDTLS")
   find_dependency(MbedTLS 3...<4)
 endif()
 
-include("${CMAKE_CURRENT_LIST_DIR}/NativeTLSShimTargets.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/OpenSSLShimTargets.cmake")
 
 set(OpenSSL_FOUND TRUE)
 set(OPENSSL_FOUND TRUE)
-set(OPENSSL_VERSION "${_native_tls_shim_openssl_version}")
-set(OpenSSL_VERSION "${_native_tls_shim_openssl_version}")
+set(OPENSSL_VERSION "${_openssl_shim_openssl_version}")
+set(OpenSSL_VERSION "${_openssl_shim_openssl_version}")
 
 set(OPENSSL_INCLUDE_DIR "${_openssl_prefix}/@CMAKE_INSTALL_INCLUDEDIR@")
 set(OPENSSL_LIBRARIES OpenSSL::SSL OpenSSL::Crypto)
