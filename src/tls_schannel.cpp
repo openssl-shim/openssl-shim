@@ -1831,6 +1831,21 @@ bool cert_matches_hostname(const X509* cert, const std::string& host, bool check
 // Non-Windows build placeholder helpers.
 #endif
 
+void ssl_set_connect_state_impl(SSL* ssl) {
+  if (!ssl || !ssl->ctx) return;
+  ssl->ctx->is_client = true;
+}
+
+void ssl_set_accept_state_impl(SSL* ssl) {
+  if (!ssl || !ssl->ctx) return;
+  ssl->ctx->is_client = false;
+}
+
+int ssl_in_init_impl(const SSL* ssl) {
+  if (!ssl) return 0;
+  return ssl->handshake_started && !ssl->handshake_done ? 1 : 0;
+}
+
 extern "C" {
 
 #include "tls_shared_exports.inl"

@@ -219,16 +219,14 @@ long SSL_ctrl(SSL* ssl, int cmd, long larg, void* parg) {
 }
 
 void SSL_set_connect_state(SSL* ssl) {
-  if (!ssl || !ssl->ctx) return;
-  ssl->ctx->is_client = true;
+  ssl_set_connect_state_impl(ssl);
 }
 
 void SSL_set_accept_state(SSL* ssl) {
-  if (!ssl || !ssl->ctx) return;
-  ssl->ctx->is_client = false;
+  ssl_set_accept_state_impl(ssl);
 }
 
-int SSL_in_init(const SSL* /*ssl*/) { return 0; }
+int SSL_in_init(const SSL* ssl) { return ssl_in_init_impl(ssl); }
 
 SSL_CTX* SSL_set_SSL_CTX(SSL* ssl, SSL_CTX* ctx) {
   if (!ssl) return nullptr;

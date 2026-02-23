@@ -188,6 +188,8 @@ if(NOT WIN32 AND
     C_STANDARD_REQUIRED ON
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON)
+  set_source_files_properties(${_usockets_dir}/src/crypto/openssl.c
+    PROPERTIES COMPILE_OPTIONS "-include;stdlib.h")
 
   target_include_directories(test_usockets PUBLIC ${_usockets_dir}/src)
   target_link_libraries(test_usockets PUBLIC OpenSSL::SSL OpenSSL::Crypto)

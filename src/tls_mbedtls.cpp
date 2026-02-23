@@ -727,6 +727,31 @@ int ssl_recv_bio_cb(void* ctx, unsigned char* buf, size_t len) {
   return rc;
 }
 
+void ssl_set_connect_state_impl(SSL* ssl) {
+  if (!ssl || !ssl->ctx) return;
+  ssl->ctx->is_client = true;
+  mbedtls_ssl_conf_endpoint(&ssl->ctx->conf, MBEDTLS_SSL_IS_CLIENT);
+  apply_ctx_verify_mode(ssl->ctx);
+  if (ssl->ssl_setup) {
+    mbedtls_ssl_session_reset(&ssl->ssl);
+  }
+}
+
+void ssl_set_accept_state_impl(SSL* ssl) {
+  if (!ssl || !ssl->ctx) return;
+  ssl->ctx->is_client = false;
+  mbedtls_ssl_conf_endpoint(&ssl->ctx->conf, MBEDTLS_SSL_IS_SERVER);
+  apply_ctx_verify_mode(ssl->ctx);
+  if (ssl->ssl_setup) {
+    mbedtls_ssl_session_reset(&ssl->ssl);
+  }
+}
+
+int ssl_in_init_impl(const SSL* ssl) {
+  if (!ssl || !ssl->ssl_setup) return 0;
+  return mbedtls_ssl_is_handshake_over(const_cast<mbedtls_ssl_context*>(&ssl->ssl)) ? 0 : 1;
+}
+
 extern "C" {
 
 #include "tls_shared_exports.inl"

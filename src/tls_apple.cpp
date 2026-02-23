@@ -1475,6 +1475,23 @@ SecKeyRef import_private_key_from_pem(const std::string& pem, const char* passph
   return key;
 }
 
+void ssl_set_connect_state_impl(SSL* ssl) {
+  if (!ssl || !ssl->ctx) return;
+  ssl->ctx->is_client = true;
+  ssl->handshake_done = false;
+}
+
+void ssl_set_accept_state_impl(SSL* ssl) {
+  if (!ssl || !ssl->ctx) return;
+  ssl->ctx->is_client = false;
+  ssl->handshake_done = false;
+}
+
+int ssl_in_init_impl(const SSL* ssl) {
+  if (!ssl) return 0;
+  return ssl->handshake_done ? 0 : 1;
+}
+
 extern "C" {
 
 #include "tls_shared_exports.inl"
