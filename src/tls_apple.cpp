@@ -1475,16 +1475,45 @@ SecKeyRef import_private_key_from_pem(const std::string& pem, const char* passph
   return key;
 }
 
+bool rebuild_ssl_for_current_endpoint(SSL* ssl) {
+  if (!ssl || !ssl->ctx) return false;
+
+  if (ssl->ssl) {
+    SSLClose(ssl->ssl);
+    CFRelease(ssl->ssl);
+    ssl->ssl = nullptr;
+  }
+
+  ssl->ssl_setup = false;
+  ssl->handshake_done = false;
+  ssl->trust_evaluated = false;
+  ssl->io_want = SSL_ERROR_NONE;
+  ssl->selected_alpn.clear();
+
+  if (ssl->peer_cert) {
+    X509_free(ssl->peer_cert);
+    ssl->peer_cert = nullptr;
+  }
+
+  return configure_ssl_instance(ssl);
+}
+
 void ssl_set_connect_state_impl(SSL* ssl) {
   if (!ssl || !ssl->ctx) return;
   ssl->ctx->is_client = true;
-  ssl->handshake_done = false;
+  if (!rebuild_ssl_for_current_endpoint(ssl)) {
+    ssl->last_ret = -1;
+    ssl->last_error = SSL_ERROR_SSL;
+  }
 }
 
 void ssl_set_accept_state_impl(SSL* ssl) {
   if (!ssl || !ssl->ctx) return;
   ssl->ctx->is_client = false;
-  ssl->handshake_done = false;
+  if (!rebuild_ssl_for_current_endpoint(ssl)) {
+    ssl->last_ret = -1;
+    ssl->last_error = SSL_ERROR_SSL;
+  }
 }
 
 int ssl_in_init_impl(const SSL* ssl) {
