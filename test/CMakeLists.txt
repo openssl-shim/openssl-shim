@@ -171,34 +171,79 @@ if(EXISTS "${_asio_include_dir}/asio.hpp")
   endif()
 endif()
 
-if(NOT WIN32 AND
-   EXISTS "${_uwebsockets_dir}/src/App.h" AND
+if(EXISTS "${_uwebsockets_dir}/src/App.h" AND
    EXISTS "${_usockets_dir}/src/libusockets.h")
-  add_library(test_usockets STATIC
+  set(_usockets_sources
     ${_usockets_dir}/src/bsd.c
     ${_usockets_dir}/src/context.c
     ${_usockets_dir}/src/loop.c
     ${_usockets_dir}/src/socket.c
     ${_usockets_dir}/src/udp.c
-    ${_usockets_dir}/src/eventing/epoll_kqueue.c
     ${_usockets_dir}/src/crypto/openssl.c
     ${_usockets_dir}/src/crypto/sni_tree.cpp)
+
+  set(_usockets_event_backend_def)
+  set(_usockets_extra_link_libs)
+
+  if(WIN32)
+    list(APPEND _usockets_sources ${_usockets_dir}/src/eventing/libuv.c)
+
+    set(_libuv_dir "${CMAKE_SOURCE_DIR}/test/libuv")
+    if(EXISTS "${_libuv_dir}/CMakeLists.txt")
+      add_subdirectory("${_libuv_dir}" "${CMAKE_CURRENT_BINARY_DIR}/libuv" SYSTEM)
+    else()
+      FetchContent_Declare(
+        libuv
+        GIT_REPOSITORY https://github.com/libuv/libuv.git
+        GIT_TAG v1.49.2
+        GIT_SHALLOW TRUE)
+      set(LIBUV_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+      set(LIBUV_BUILD_BENCH OFF CACHE BOOL "" FORCE)
+      set(LIBUV_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+      FetchContent_MakeAvailable(libuv)
+    endif()
+
+    if(TARGET uv_a)
+      set(_libuv_target uv_a)
+    elseif(TARGET uv)
+      set(_libuv_target uv)
+    elseif(TARGET libuv::uv_a)
+      set(_libuv_target libuv::uv_a)
+    elseif(TARGET libuv::uv)
+      set(_libuv_target libuv::uv)
+    else()
+      message(FATAL_ERROR "Unable to resolve libuv target for test_usockets on Windows")
+    endif()
+
+    set(_usockets_event_backend_def LIBUS_USE_LIBUV)
+    list(APPEND _usockets_extra_link_libs ${_libuv_target} ws2_32 iphlpapi userenv psapi)
+  else()
+    list(APPEND _usockets_sources ${_usockets_dir}/src/eventing/epoll_kqueue.c)
+    if(APPLE)
+      set(_usockets_event_backend_def LIBUS_USE_KQUEUE)
+    else()
+      set(_usockets_event_backend_def LIBUS_USE_EPOLL)
+    endif()
+  endif()
+
+  add_library(test_usockets STATIC ${_usockets_sources})
   set_target_properties(test_usockets PROPERTIES
     C_STANDARD 11
     C_STANDARD_REQUIRED ON
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON)
-  set_source_files_properties(${_usockets_dir}/src/crypto/openssl.c
-    PROPERTIES COMPILE_OPTIONS "-include;stdlib.h")
+
+  if(NOT MSVC)
+    set_source_files_properties(${_usockets_dir}/src/crypto/openssl.c
+      PROPERTIES COMPILE_OPTIONS "-include;stdlib.h")
+  endif()
 
   target_include_directories(test_usockets PUBLIC ${_usockets_dir}/src)
   target_link_libraries(test_usockets PUBLIC OpenSSL::SSL OpenSSL::Crypto)
-  target_compile_definitions(test_usockets PUBLIC LIBUS_USE_OPENSSL)
-  if(APPLE)
-    target_compile_definitions(test_usockets PUBLIC LIBUS_USE_KQUEUE)
-  else()
-    target_compile_definitions(test_usockets PUBLIC LIBUS_USE_EPOLL)
+  if(_usockets_extra_link_libs)
+    target_link_libraries(test_usockets PUBLIC ${_usockets_extra_link_libs})
   endif()
+  target_compile_definitions(test_usockets PUBLIC LIBUS_USE_OPENSSL ${_usockets_event_backend_def})
 
   find_package(Threads REQUIRED)
   target_link_libraries(test_usockets PUBLIC Threads::Threads)
@@ -207,12 +252,10 @@ if(NOT WIN32 AND
   target_include_directories(test_uwebsockets_https_server PRIVATE
     ${_uwebsockets_dir}/src
     ${_usockets_dir}/src)
-  target_compile_definitions(test_uwebsockets_https_server PRIVATE UWS_NO_ZLIB LIBUS_USE_OPENSSL)
-  if(APPLE)
-    target_compile_definitions(test_uwebsockets_https_server PRIVATE LIBUS_USE_KQUEUE)
-  else()
-    target_compile_definitions(test_uwebsockets_https_server PRIVATE LIBUS_USE_EPOLL)
-  endif()
+  target_compile_definitions(test_uwebsockets_https_server PRIVATE
+    UWS_NO_ZLIB
+    LIBUS_USE_OPENSSL
+    ${_usockets_event_backend_def})
   target_link_libraries(test_uwebsockets_https_server PRIVATE
     test_usockets
     OpenSSL::SSL
