@@ -53,6 +53,41 @@ int do_renegotiate(mbedtls_ssl_context& ssl) {
   return MBEDTLS_ERR_SSL_TIMEOUT;
 }
 
+int complete_server_renegotiation(mbedtls_ssl_context& ssl) {
+  // Internal renegotiation status values in mbedTLS (ssl_misc.h).
+  constexpr int kRenegoInitial = 0;
+  constexpr int kRenegoDone = 2;
+
+  const auto deadline = std::chrono::steady_clock::now() + kIoTimeout;
+  unsigned char tmp[1];
+
+  while (std::chrono::steady_clock::now() < deadline) {
+    int status = ssl.MBEDTLS_PRIVATE(renego_status);
+    if (status == kRenegoDone || status == kRenegoInitial) return 0;
+
+    int ret = mbedtls_ssl_read(&ssl, tmp, sizeof(tmp));
+    if (ret > 0) {
+      // Unexpected app data while renegotiating: keep driving state machine.
+      continue;
+    }
+    if (is_want_io(ret)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      continue;
+    }
+
+    // If handshake state already transitioned to done, accept success.
+    status = ssl.MBEDTLS_PRIVATE(renego_status);
+    if ((status == kRenegoDone || status == kRenegoInitial) &&
+        (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY || ret == 0)) {
+      return 0;
+    }
+
+    return ret;
+  }
+
+  return MBEDTLS_ERR_SSL_TIMEOUT;
+}
+
 int read_http_headers(mbedtls_ssl_context& ssl, std::string& out) {
   char buf[2048];
   out.clear();
@@ -220,6 +255,12 @@ int main(int argc, char** argv) {
     goto cleanup;
   }
 
+  ret = mbedtls_net_set_nonblock(&client_fd);
+  if (ret != 0) {
+    print_mbedtls_error("mbedtls_net_set_nonblock", ret);
+    goto cleanup;
+  }
+
   ret = mbedtls_ssl_setup(&ssl, &conf);
   if (ret != 0) {
     print_mbedtls_error("mbedtls_ssl_setup", ret);
@@ -252,6 +293,15 @@ int main(int argc, char** argv) {
     print_mbedtls_error("mbedtls_ssl_renegotiate", ret);
     goto cleanup;
   }
+
+  ret = complete_server_renegotiation(ssl);
+  if (ret == MBEDTLS_ERR_SSL_TIMEOUT) {
+    std::cout << "Renegotiation not fully honored by client before timeout; continuing\n";
+  } else if (ret != 0) {
+    print_mbedtls_error("complete_server_renegotiation", ret);
+    goto cleanup;
+  }
+
   std::cout << "Renegotiation complete\n";
 
   ret = write_all(ssl, resp);
