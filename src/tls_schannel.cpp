@@ -1415,7 +1415,9 @@ bool schannel_handshake(SSL* ssl) {
 
     bool provide_input = false;
     if (ssl->ctx->is_client) {
-      provide_input = ssl->handshake_started;
+      // Client renegotiation may need an InitializeSecurityContext call with no
+      // input token to emit a new ClientHello.
+      provide_input = ssl->handshake_started && !ssl->incoming_encrypted.empty();
     } else {
       provide_input = true;
     }
@@ -1589,31 +1591,44 @@ bool ensure_decrypted_data(SSL* ssl) {
       continue;
     }
 
-    if (st == SEC_I_CONTEXT_EXPIRED) {
-      ssl->shutdown_state |= SSL_RECEIVED_SHUTDOWN;
-      ssl->last_error = SSL_ERROR_ZERO_RETURN;
-      ssl->last_ret = 0;
-      return false;
-    }
-
-    if (st == SEC_I_RENEGOTIATE) {
-      ssl->last_error = SSL_ERROR_WANT_READ;
-      ssl->last_ret = -1;
-      return false;
-    }
-
-    if (st != SEC_E_OK) {
-      ssl->last_error = SSL_ERROR_SSL;
-      ssl->last_ret = -1;
-      set_error_message("DecryptMessage failed: " + std::to_string(static_cast<long>(st)));
-      return false;
-    }
-
     SecBuffer* data_buf = nullptr;
     SecBuffer* extra_buf = nullptr;
     for (auto& b : bufs) {
       if (b.BufferType == SECBUFFER_DATA) data_buf = &b;
       if (b.BufferType == SECBUFFER_EXTRA) extra_buf = &b;
+    }
+
+    auto consume_extra = [&]() {
+      size_t extra = extra_buf ? static_cast<size_t>(extra_buf->cbBuffer) : 0;
+      if (extra > 0) {
+        size_t used = ssl->incoming_encrypted.size() - extra;
+        std::memmove(ssl->incoming_encrypted.data(),
+                     ssl->incoming_encrypted.data() + used,
+                     extra);
+        ssl->incoming_encrypted.resize(extra);
+      } else {
+        ssl->incoming_encrypted.clear();
+      }
+    };
+
+    if (st == SEC_I_RENEGOTIATE) {
+      consume_extra();
+      ssl->handshake_done = false;
+      ssl->handshake_needs_finish = false;
+      ssl->have_sizes = false;
+      ssl->decrypted.clear();
+      ssl->decrypted_offset = 0;
+      ssl->last_error = SSL_ERROR_WANT_READ;
+      ssl->last_ret = -1;
+      return false;
+    }
+
+    bool context_expired = (st == SEC_I_CONTEXT_EXPIRED);
+    if (st != SEC_E_OK && !context_expired) {
+      ssl->last_error = SSL_ERROR_SSL;
+      ssl->last_ret = -1;
+      set_error_message("DecryptMessage failed: " + std::to_string(static_cast<long>(st)));
+      return false;
     }
 
     if (data_buf && data_buf->pvBuffer && data_buf->cbBuffer > 0) {
@@ -1622,15 +1637,21 @@ bool ensure_decrypted_data(SSL* ssl) {
       ssl->decrypted_offset = 0;
     }
 
-    size_t extra = extra_buf ? static_cast<size_t>(extra_buf->cbBuffer) : 0;
-    if (extra > 0) {
-      size_t used = ssl->incoming_encrypted.size() - extra;
-      std::memmove(ssl->incoming_encrypted.data(),
-                   ssl->incoming_encrypted.data() + used,
-                   extra);
-      ssl->incoming_encrypted.resize(extra);
-    } else {
-      ssl->incoming_encrypted.clear();
+    consume_extra();
+
+    if (context_expired) {
+      ssl->shutdown_state |= SSL_RECEIVED_SHUTDOWN;
+      if (ssl->decrypted.empty()) {
+        if (!ssl->incoming_encrypted.empty()) {
+          continue;
+        }
+        ssl->last_error = SSL_ERROR_ZERO_RETURN;
+        ssl->last_ret = 0;
+        return false;
+      }
+      ssl->last_error = SSL_ERROR_NONE;
+      ssl->last_ret = static_cast<int>(ssl->decrypted.size());
+      return true;
     }
 
     if (!ssl->decrypted.empty()) return true;
