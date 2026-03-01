@@ -84,15 +84,13 @@ if(OPENSSL_SHIM_EFFECTIVE_BACKEND STREQUAL "MBEDTLS")
     FetchContent_Declare(
       mbedtls
       GIT_REPOSITORY https://github.com/mrexodia/mbedtls.git
-      GIT_TAG cmake-fixes-3.6
+      GIT_TAG v3.6.5-clang-windows-fix
       GIT_SHALLOW TRUE)
     set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
     set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
     set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
     # Ensure vendored mbedTLS exports and installs a proper CMake package.
     set(DISABLE_PACKAGE_CONFIG_AND_INSTALL OFF CACHE BOOL "" FORCE)
-    # mrexodia/mbedtls cmake-fixes-3.6 uses generated sources on Windows.
-    set(GEN_FILES ON CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(mbedtls)
   endif()
 
