@@ -116,8 +116,8 @@ add_subdirectory(path/to/openssl-shim)
 include(FetchContent)
 
 FetchContent_Declare(openssl_shim
-  GIT_REPOSITORY <this-repo-url>
-  GIT_TAG main)
+  GIT_REPOSITORY https://github.com/openssl-shim/openssl-shim
+  GIT_TAG master)
 FetchContent_MakeAvailable(openssl_shim)
 
 # then add dependencies that call find_package(OpenSSL)
