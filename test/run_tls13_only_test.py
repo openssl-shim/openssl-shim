@@ -77,6 +77,12 @@ def run() -> int:
 
             if client_res.returncode == 0:
                 break
+            if client_res.returncode == 77:
+                if client_res.stdout:
+                    print(client_res.stdout, end="")
+                if client_res.stderr:
+                    print(client_res.stderr, end="")
+                return 77
 
             # Retry startup races where server is not accepting yet.
             if "error=" in (client_res.stderr or "") or "request failed" in (client_res.stderr or ""):

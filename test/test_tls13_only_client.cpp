@@ -25,7 +25,11 @@ int main(int argc, char** argv) {
   httplib::SSLClient cli("127.0.0.1", port);
   cli.set_ca_cert_path(ca.c_str());
   if (auto* ctx = cli.ssl_context()) {
-    SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+    if (SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION) != 1 ||
+        SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION) != 1) {
+      std::cerr << "TLS 1.3 is not supported by this backend, skipping\n";
+      return 77;
+    }
   }
 
   auto res = cli.Get("/tls13");
