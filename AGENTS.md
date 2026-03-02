@@ -55,6 +55,7 @@ Before committing, quickly scan for new duplication across backend files.
 - Use explicit timeout values in runners and CTest.
 - In test/subproject integration, let dependencies resolve OpenSSL via `find_package(OpenSSL)` through shim logic.
 - Do not hardcode fake `OPENSSL_*` found-state variables as a replacement for discovery.
+- Do not disable failing tests based on the backend or platform
 
 ---
 

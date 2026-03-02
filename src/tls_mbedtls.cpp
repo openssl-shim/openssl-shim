@@ -1437,7 +1437,7 @@ int SSL_CTX_set_min_proto_version(SSL_CTX* ctx, int version) {
     case TLS1_2_VERSION:
       v = MBEDTLS_SSL_VERSION_TLS1_2;
       break;
-#ifdef MBEDTLS_SSL_VERSION_TLS1_3
+#if defined(MBEDTLS_SSL_PROTO_TLS1_3)
     case TLS1_3_VERSION:
       v = MBEDTLS_SSL_VERSION_TLS1_3;
       break;
@@ -1463,7 +1463,7 @@ int SSL_CTX_set_max_proto_version(SSL_CTX* ctx, int version) {
     case TLS1_2_VERSION:
       v = MBEDTLS_SSL_VERSION_TLS1_2;
       break;
-#ifdef MBEDTLS_SSL_VERSION_TLS1_3
+#if defined(MBEDTLS_SSL_PROTO_TLS1_3)
     case TLS1_3_VERSION:
       v = MBEDTLS_SSL_VERSION_TLS1_3;
       break;

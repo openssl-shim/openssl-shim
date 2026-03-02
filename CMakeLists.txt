@@ -37,15 +37,65 @@ endif()
 
 set(OPENSSL_SHIM_EFFECTIVE_BACKEND "${_backend}")
 
+set(_mbedtls_targets)
+set(_openssl_shim_need_mbedtls OFF)
+if(OPENSSL_SHIM_EFFECTIVE_BACKEND STREQUAL "MBEDTLS" OR OPENSSL_SHIM_BUILD_TESTS)
+  set(_openssl_shim_need_mbedtls ON)
+endif()
 
-add_library(openssl_shim
+if(_openssl_shim_need_mbedtls)
+  set(_mbedtls_use_fetch ${OPENSSL_SHIM_ALWAYS_FETCH_MBEDTLS})
+  if(NOT _mbedtls_use_fetch)
+    # Prefer an already-installed MbedTLS 3.x when available.
+    find_package(MbedTLS 3...<4 QUIET)
+    if(NOT (TARGET mbedtls AND TARGET mbedx509 AND TARGET mbedcrypto) AND
+       NOT (TARGET MbedTLS::mbedtls AND TARGET MbedTLS::mbedx509 AND TARGET MbedTLS::mbedcrypto))
+      set(_mbedtls_use_fetch ON)
+    endif()
+  endif()
+
+  if(_mbedtls_use_fetch)
+    include(FetchContent)
+    message(STATUS "Fetching MbedTLS v3.6.5-clang-windows-fix...")
+    FetchContent_Declare(
+      mbedtls
+      GIT_REPOSITORY https://github.com/mrexodia/mbedtls.git
+      GIT_TAG v3.6.5-clang-windows-fix
+      GIT_SHALLOW TRUE)
+    set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+    set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
+    set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
+    # Ensure vendored mbedTLS exports and installs a proper CMake package.
+    if(PROJECT_IS_TOP_LEVEL)
+      set(DISABLE_PACKAGE_CONFIG_AND_INSTALL OFF CACHE BOOL "" FORCE)
+    endif()
+    FetchContent_MakeAvailable(mbedtls)
+  endif()
+
+  if(TARGET mbedtls AND TARGET mbedx509 AND TARGET mbedcrypto)
+    set(_mbedtls_targets mbedtls mbedx509 mbedcrypto)
+  elseif(TARGET MbedTLS::mbedtls AND TARGET MbedTLS::mbedx509 AND TARGET MbedTLS::mbedcrypto)
+    set(_mbedtls_targets MbedTLS::mbedtls MbedTLS::mbedx509 MbedTLS::mbedcrypto)
+  else()
+    message(FATAL_ERROR "Unable to resolve MbedTLS targets")
+  endif()
+endif()
+
+# Expose for test/CMakeLists.txt.
+set(OPENSSL_SHIM_TEST_MBEDTLS_TARGETS "${_mbedtls_targets}")
+
+add_library(openssl_shim STATIC
   src/tls_common.cpp
   src/tls_common.hpp
   src/tls_shared_exports.inl
 )
 
-if(WIN32 AND BUILD_SHARED_LIBS)
-  set_target_properties(openssl_shim PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+if(BUILD_SHARED_LIBS)
+  # TODO: we need to create separate shared libraries
+  message(FATAL_ERROR "Building shared libraries is not yet supported for openssl_shim")
+  if(WIN32)
+    set_target_properties(openssl_shim PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+  endif()
 endif()
 
 add_library(openssl_shim::openssl_shim ALIAS openssl_shim)
@@ -69,37 +119,8 @@ endif()
 if(OPENSSL_SHIM_EFFECTIVE_BACKEND STREQUAL "MBEDTLS")
   message(STATUS "MbedTLS backend selected")
 
-  set(_mbedtls_use_fetch ${OPENSSL_SHIM_ALWAYS_FETCH_MBEDTLS})
-  if(NOT _mbedtls_use_fetch)
-    # Prefer an already-installed MbedTLS 3.x when available.
-    find_package(MbedTLS 3...<4 QUIET)
-    if(NOT (TARGET mbedtls AND TARGET mbedx509 AND TARGET mbedcrypto) AND
-       NOT (TARGET MbedTLS::mbedtls AND TARGET MbedTLS::mbedx509 AND TARGET MbedTLS::mbedcrypto))
-      set(_mbedtls_use_fetch ON)
-    endif()
-  endif()
-
-  if(_mbedtls_use_fetch)
-    include(FetchContent)
-    FetchContent_Declare(
-      mbedtls
-      GIT_REPOSITORY https://github.com/mrexodia/mbedtls.git
-      GIT_TAG v3.6.5-clang-windows-fix
-      GIT_SHALLOW TRUE)
-    set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
-    set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
-    set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
-    # Ensure vendored mbedTLS exports and installs a proper CMake package.
-    set(DISABLE_PACKAGE_CONFIG_AND_INSTALL OFF CACHE BOOL "" FORCE)
-    FetchContent_MakeAvailable(mbedtls)
-  endif()
-
-  if(TARGET mbedtls AND TARGET mbedx509 AND TARGET mbedcrypto)
-    set(_mbedtls_targets mbedtls mbedx509 mbedcrypto)
-  elseif(TARGET MbedTLS::mbedtls AND TARGET MbedTLS::mbedx509 AND TARGET MbedTLS::mbedcrypto)
-    set(_mbedtls_targets MbedTLS::mbedtls MbedTLS::mbedx509 MbedTLS::mbedcrypto)
-  else()
-    message(FATAL_ERROR "Unable to resolve MbedTLS targets")
+  if(NOT _mbedtls_targets)
+    message(FATAL_ERROR "MbedTLS backend selected but no MbedTLS targets are available")
   endif()
 
   target_sources(openssl_shim PRIVATE src/tls_mbedtls.cpp)
@@ -145,15 +166,18 @@ if(NOT TARGET OpenSSL::Crypto)
 endif()
 
 if(OPENSSL_SHIM_BUILD_TESTS)
+  message(STATUS "Tests enabled")
   enable_testing()
   add_subdirectory(test)
 endif()
 
 if(OPENSSL_SHIM_BUILD_EXAMPLES)
+  message(STATUS "Examples enabled")
   add_subdirectory(example)
 endif()
 
 if(OPENSSL_SHIM_ENABLE_INSTALL)
+  message(STATUS "Install enabled")
   include(CMakePackageConfigHelpers)
 
   install(TARGETS openssl_shim openssl_ssl openssl_crypto

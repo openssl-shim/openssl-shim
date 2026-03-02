@@ -1,5 +1,9 @@
 include(FetchContent)
 
+if(WIN32)
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS=1 _CRT_NONSTDC_NO_WARNINGS=1)
+endif()
+
 function(openssl_shim_reset_openssl_find_state)
   foreach(_var
       OPENSSL_FOUND OpenSSL_FOUND
@@ -136,39 +140,51 @@ add_executable(test_tls13_only_client test_tls13_only_client.cpp)
 target_compile_definitions(test_tls13_only_client PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT NTS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(test_tls13_only_client PRIVATE httplib::httplib OpenSSL::SSL OpenSSL::Crypto)
 
-if(EXISTS "${_asio_include_dir}/asio.hpp")
-  add_executable(test_asio_https_server test_asio_https_server.cpp)
-  target_include_directories(test_asio_https_server PRIVATE "${_asio_include_dir}")
-  target_compile_definitions(test_asio_https_server PRIVATE ASIO_STANDALONE)
-  target_link_libraries(test_asio_https_server PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+add_executable(test_reneg_client test_reneg_client.cpp)
+target_compile_definitions(test_reneg_client PRIVATE NTS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_link_libraries(test_reneg_client PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 
-  add_executable(test_asio_https_server_asn1 test_asio_https_server_asn1.cpp)
-  target_include_directories(test_asio_https_server_asn1 PRIVATE "${_asio_include_dir}")
-  target_compile_definitions(test_asio_https_server_asn1 PRIVATE ASIO_STANDALONE)
-  target_link_libraries(test_asio_https_server_asn1 PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+if(OPENSSL_SHIM_TEST_MBEDTLS_TARGETS)
+  add_executable(test_mbedtls_reneg_server test_mbedtls_reneg_server.cpp)
+  target_link_libraries(test_mbedtls_reneg_server PRIVATE ${OPENSSL_SHIM_TEST_MBEDTLS_TARGETS})
 
-  add_executable(test_asio_https_server_rsa_asn1 test_asio_https_server_rsa_asn1.cpp)
-  target_include_directories(test_asio_https_server_rsa_asn1 PRIVATE "${_asio_include_dir}")
-  target_compile_definitions(test_asio_https_server_rsa_asn1 PRIVATE ASIO_STANDALONE)
-  target_link_libraries(test_asio_https_server_rsa_asn1 PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+  add_executable(test_mbedtls_tls13_server test_mbedtls_tls13_server.cpp)
+  target_link_libraries(test_mbedtls_tls13_server PRIVATE ${OPENSSL_SHIM_TEST_MBEDTLS_TARGETS})
 
-  add_executable(test_asio_https_server_chain_memory test_asio_https_server_chain_memory.cpp)
-  target_include_directories(test_asio_https_server_chain_memory PRIVATE "${_asio_include_dir}")
-  target_compile_definitions(test_asio_https_server_chain_memory PRIVATE ASIO_STANDALONE)
-  target_link_libraries(test_asio_https_server_chain_memory PRIVATE OpenSSL::SSL OpenSSL::Crypto)
-
-  add_executable(test_asio_https_client test_asio_https_client.cpp)
-  target_include_directories(test_asio_https_client PRIVATE "${_asio_include_dir}")
-  target_compile_definitions(test_asio_https_client PRIVATE ASIO_STANDALONE)
-  target_link_libraries(test_asio_https_client PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+  add_executable(test_mbedtls_direct_reneg_client test_mbedtls_direct_reneg_client.cpp)
+  target_compile_definitions(test_mbedtls_direct_reneg_client PRIVATE NTS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+  target_link_libraries(test_mbedtls_direct_reneg_client PRIVATE ${OPENSSL_SHIM_TEST_MBEDTLS_TARGETS})
 
   if(WIN32)
-    target_link_libraries(test_asio_https_server PRIVATE ws2_32)
-    target_link_libraries(test_asio_https_server_asn1 PRIVATE ws2_32)
-    target_link_libraries(test_asio_https_server_rsa_asn1 PRIVATE ws2_32)
-    target_link_libraries(test_asio_https_server_chain_memory PRIVATE ws2_32)
-    target_link_libraries(test_asio_https_client PRIVATE ws2_32)
+    target_link_libraries(test_mbedtls_reneg_server PRIVATE ws2_32)
+    target_link_libraries(test_mbedtls_tls13_server PRIVATE ws2_32)
+    target_link_libraries(test_mbedtls_direct_reneg_client PRIVATE ws2_32)
   endif()
+endif()
+
+if(EXISTS "${_asio_include_dir}/asio.hpp")
+  add_library(asio_standalone INTERFACE)
+  target_include_directories(asio_standalone INTERFACE "${_asio_include_dir}")
+  target_compile_definitions(asio_standalone INTERFACE ASIO_STANDALONE _WIN32_WINNT=0x0601)
+  target_link_libraries(asio_standalone INTERFACE OpenSSL::SSL OpenSSL::Crypto)
+  if(WIN32)
+    target_link_libraries(asio_standalone INTERFACE ws2_32)
+  endif()
+
+  add_executable(test_asio_https_server test_asio_https_server.cpp)
+  target_link_libraries(test_asio_https_server PRIVATE asio_standalone)
+
+  add_executable(test_asio_https_server_asn1 test_asio_https_server_asn1.cpp)
+  target_link_libraries(test_asio_https_server_asn1 PRIVATE asio_standalone)
+
+  add_executable(test_asio_https_server_rsa_asn1 test_asio_https_server_rsa_asn1.cpp)
+  target_link_libraries(test_asio_https_server_rsa_asn1 PRIVATE asio_standalone)
+
+  add_executable(test_asio_https_server_chain_memory test_asio_https_server_chain_memory.cpp)
+  target_link_libraries(test_asio_https_server_chain_memory PRIVATE asio_standalone)
+
+  add_executable(test_asio_https_client test_asio_https_client.cpp)
+  target_link_libraries(test_asio_https_client PRIVATE asio_standalone)
 endif()
 
 if(EXISTS "${_uwebsockets_dir}/src/App.h" AND
@@ -281,7 +297,7 @@ add_test(NAME test_ixwebsocket_server COMMAND test_ixwebsocket_server)
 add_test(NAME test_ixwebsocket_verify_disabled COMMAND test_ixwebsocket_verify_disabled)
 add_test(NAME test_ixhttp_tls_matrix COMMAND test_ixhttp_tls_matrix)
 add_test(NAME test_ixwebsocket_mtls COMMAND test_ixwebsocket_mtls)
-if(EXISTS "${_asio_include_dir}/asio.hpp")
+if(TARGET asio_standalone)
   add_test(NAME test_asio_https_roundtrip
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/run_asio_https_roundtrip.py
       --source-dir ${CMAKE_SOURCE_DIR}
@@ -343,30 +359,33 @@ if(EXISTS "${_asio_include_dir}/asio.hpp")
     set_tests_properties(test_uwebsockets_https_roundtrip PROPERTIES TIMEOUT 60)
   endif()
 endif()
-if(NOT OPENSSL_SHIM_EFFECTIVE_BACKEND STREQUAL "SCHANNEL")
-  if(CMAKE_CONFIGURATION_TYPES)
-    add_test(NAME test_tls13_only
-      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/run_tls13_only_test.py
-        --build-dir ${CMAKE_BINARY_DIR}
+if(NOT OPENSSL_SHIM_EFFECTIVE_BACKEND STREQUAL "SCHANNEL" AND
+   TARGET test_mbedtls_tls13_server)
+  add_test(NAME test_tls13_only
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/run_tls13_only_test.py
+      --source-dir ${CMAKE_SOURCE_DIR}
+      --server-bin $<TARGET_FILE:test_mbedtls_tls13_server>
+      --client-bin $<TARGET_FILE:test_tls13_only_client>)
+  set_tests_properties(test_tls13_only PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+endif()
+
+if(TARGET test_mbedtls_reneg_server AND TARGET test_reneg_client)
+  add_test(NAME test_reneg_roundtrip
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/run_mbedtls_reneg_roundtrip.py
+      --source-dir ${CMAKE_SOURCE_DIR}
+      --server-bin $<TARGET_FILE:test_mbedtls_reneg_server>
+      --client-bin $<TARGET_FILE:test_reneg_client>)
+  set_tests_properties(test_reneg_roundtrip PROPERTIES TIMEOUT 90)
+
+  if(TARGET test_mbedtls_direct_reneg_client)
+    add_test(NAME test_mbedtls_direct_reneg_roundtrip
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/run_mbedtls_reneg_roundtrip.py
         --source-dir ${CMAKE_SOURCE_DIR}
-        --client-bin $<TARGET_FILE:test_tls13_only_client>
-        --cmake-generator ${CMAKE_GENERATOR}
-        --cmake-generator-platform ${CMAKE_GENERATOR_PLATFORM}
-        --cmake-generator-toolset ${CMAKE_GENERATOR_TOOLSET}
-        --multi-config 1
-        --config $<CONFIG>)
-  else()
-    add_test(NAME test_tls13_only
-      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/run_tls13_only_test.py
-        --build-dir ${CMAKE_BINARY_DIR}
-        --source-dir ${CMAKE_SOURCE_DIR}
-        --client-bin $<TARGET_FILE:test_tls13_only_client>
-        --cmake-generator ${CMAKE_GENERATOR}
-        --cmake-generator-platform ${CMAKE_GENERATOR_PLATFORM}
-        --cmake-generator-toolset ${CMAKE_GENERATOR_TOOLSET}
-        --multi-config 0)
+        --server-bin $<TARGET_FILE:test_mbedtls_reneg_server>
+        --client-bin $<TARGET_FILE:test_mbedtls_direct_reneg_client>
+        --port 9466)
+    set_tests_properties(test_mbedtls_direct_reneg_roundtrip PROPERTIES TIMEOUT 90)
   endif()
-  set_tests_properties(test_tls13_only PROPERTIES TIMEOUT 120)
 endif()
 
 add_executable(debug_schannel_init debug_schannel_init.cpp)

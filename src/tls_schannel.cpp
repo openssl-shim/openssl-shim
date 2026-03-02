@@ -73,6 +73,13 @@ using openssl_shim::wildcard_match;
 
 #ifdef _WIN32
 using socket_len_t = int;
+
+enum class SchannelRecvState {
+  Ready,
+  Renegotiating,
+  CloseNotifySeen,
+  Failed,
+};
 #else
 using socket_len_t = socklen_t;
 #endif
@@ -293,11 +300,31 @@ struct ssl_st {
 
   bool shutdown_sent = false;
   bool handshake_needs_finish = false;
+  SchannelRecvState recv_state = SchannelRecvState::Ready;
 #endif
 
   X509* peer_cert = nullptr;
 
   ~ssl_st() {
+    auto wipe_bytes = [](std::vector<unsigned char>& bytes) {
+      if (!bytes.empty()) {
+#ifdef _WIN32
+        SecureZeroMemory(bytes.data(), bytes.size());
+#else
+        std::fill(bytes.begin(), bytes.end(), 0);
+#endif
+      }
+      bytes.clear();
+      bytes.shrink_to_fit();
+    };
+
+    wipe_bytes(peeked_plaintext);
+#ifdef _WIN32
+    wipe_bytes(incoming_encrypted);
+    wipe_bytes(decrypted);
+    wipe_bytes(pending_send);
+#endif
+
     if (peer_cert) X509_free(peer_cert);
     if (rbio) {
       if (wbio == rbio) {
@@ -832,6 +859,34 @@ bool has_ssl_transport(const SSL* ssl) {
   return ssl->fd >= 0;
 }
 
+void discard_leading_handshake_records(std::vector<unsigned char>& encrypted) {
+  size_t off = 0;
+  while (off + 5 <= encrypted.size()) {
+    unsigned char content_type = encrypted[off];
+    if (content_type != 20 && content_type != 22) {
+      break;
+    }
+
+    size_t record_len = (static_cast<size_t>(encrypted[off + 3]) << 8) |
+                        static_cast<size_t>(encrypted[off + 4]);
+    size_t total = 5 + record_len;
+    if (off + total > encrypted.size()) {
+      break;
+    }
+    off += total;
+  }
+
+  if (off == 0) return;
+  if (off >= encrypted.size()) {
+    encrypted.clear();
+    return;
+  }
+
+  size_t remain = encrypted.size() - off;
+  std::memmove(encrypted.data(), encrypted.data() + off, remain);
+  encrypted.resize(remain);
+}
+
 bool flush_pending_send(SSL* ssl) {
   if (!ssl) return false;
   while (ssl->pending_send_offset < ssl->pending_send.size()) {
@@ -932,9 +987,13 @@ bool recv_into_handshake_buffer(SSL* ssl) {
     if (!socket_transport) {
       ssl->last_error = SSL_ERROR_WANT_READ;
       ssl->last_ret = -1;
-    } else {
+    } else if (ssl->recv_state == SchannelRecvState::CloseNotifySeen) {
       ssl->last_error = SSL_ERROR_ZERO_RETURN;
       ssl->last_ret = 0;
+    } else {
+      ssl->last_error = SSL_ERROR_SSL;
+      ssl->last_ret = -1;
+      set_error_message("unexpected EOF on TLS transport (missing close_notify)");
     }
     return false;
   }
@@ -1388,6 +1447,12 @@ bool post_handshake_verify(SSL* ssl) {
 bool schannel_handshake(SSL* ssl) {
   if (!ssl || !ssl->ctx) return false;
 
+  if (ssl->recv_state == SchannelRecvState::Failed) {
+    if (ssl->last_error == SSL_ERROR_NONE) ssl->last_error = SSL_ERROR_SSL;
+    if (ssl->last_ret >= 0) ssl->last_ret = -1;
+    return false;
+  }
+
   if (ssl->handshake_done) return true;
 
   if (ssl->handshake_needs_finish) {
@@ -1397,6 +1462,7 @@ bool schannel_handshake(SSL* ssl) {
     if (!post_handshake_verify(ssl)) return false;
     ssl->handshake_done = true;
     ssl->handshake_needs_finish = false;
+    ssl->recv_state = SchannelRecvState::Ready;
     ssl->last_error = SSL_ERROR_NONE;
     ssl->last_ret = 1;
     return true;
@@ -1415,7 +1481,9 @@ bool schannel_handshake(SSL* ssl) {
 
     bool provide_input = false;
     if (ssl->ctx->is_client) {
-      provide_input = ssl->handshake_started;
+      // Client renegotiation may need an InitializeSecurityContext call with no
+      // input token to emit a new ClientHello.
+      provide_input = ssl->handshake_started && !ssl->incoming_encrypted.empty();
     } else {
       provide_input = true;
     }
@@ -1488,7 +1556,15 @@ bool schannel_handshake(SSL* ssl) {
     }
 
     ssl->handshake_started = true;
-    ssl->ctxt_valid = true;
+    if (st == SEC_E_OK ||
+        st == SEC_I_CONTINUE_NEEDED ||
+        st == SEC_I_COMPLETE_AND_CONTINUE ||
+        st == SEC_I_COMPLETE_NEEDED ||
+        st == SEC_E_INCOMPLETE_MESSAGE ||
+        st == SEC_I_CONTEXT_EXPIRED ||
+        st == SEC_I_RENEGOTIATE) {
+      ssl->ctxt_valid = true;
+    }
 
     if (out_buffer.pvBuffer && out_buffer.cbBuffer) {
       auto* p = static_cast<unsigned char*>(out_buffer.pvBuffer);
@@ -1506,6 +1582,8 @@ bool schannel_handshake(SSL* ssl) {
                      ssl->incoming_encrypted.data() + used,
                      extra);
         ssl->incoming_encrypted.resize(extra);
+      } else if (ssl->recv_state == SchannelRecvState::Renegotiating && st == SEC_E_OK) {
+        discard_leading_handshake_records(ssl->incoming_encrypted);
       } else {
         ssl->incoming_encrypted.clear();
       }
@@ -1523,6 +1601,7 @@ bool schannel_handshake(SSL* ssl) {
       if (!post_handshake_verify(ssl)) return false;
       ssl->handshake_done = true;
       ssl->handshake_needs_finish = false;
+      ssl->recv_state = SchannelRecvState::Ready;
       ssl->last_error = SSL_ERROR_NONE;
       ssl->last_ret = 1;
       return true;
@@ -1542,12 +1621,23 @@ bool schannel_handshake(SSL* ssl) {
     }
 
     if (st == SEC_I_CONTEXT_EXPIRED) {
+      bool was_renegotiating = (ssl->recv_state == SchannelRecvState::Renegotiating);
       ssl->shutdown_state |= SSL_RECEIVED_SHUTDOWN;
-      ssl->last_error = SSL_ERROR_ZERO_RETURN;
-      ssl->last_ret = 0;
+      ssl->recv_state = SchannelRecvState::CloseNotifySeen;
+      if (was_renegotiating) {
+        // Let receive path drain any already-buffered appdata before surfacing EOF.
+        ssl->handshake_done = true;
+        ssl->handshake_needs_finish = false;
+        ssl->last_error = SSL_ERROR_WANT_READ;
+        ssl->last_ret = -1;
+      } else {
+        ssl->last_error = SSL_ERROR_ZERO_RETURN;
+        ssl->last_ret = 0;
+      }
       return false;
     }
 
+    ssl->recv_state = SchannelRecvState::Failed;
     ssl->last_error = map_sec_error_to_ssl_error(st);
     ssl->last_ret = -1;
     set_error_message("TLS handshake failed: " + std::to_string(static_cast<long>(st)));
@@ -1555,8 +1645,46 @@ bool schannel_handshake(SSL* ssl) {
   }
 }
 
+bool drive_receive_renegotiation(SSL* ssl) {
+  if (!ssl) return false;
+  if (ssl->recv_state != SchannelRecvState::Renegotiating) return true;
+
+  if (ssl->handshake_done) {
+    ssl->recv_state = SchannelRecvState::Ready;
+    return true;
+  }
+
+  if (!schannel_handshake(ssl)) {
+    if (ssl->last_error != SSL_ERROR_WANT_READ && ssl->last_error != SSL_ERROR_WANT_WRITE) {
+      ssl->recv_state = SchannelRecvState::Failed;
+    }
+    return false;
+  }
+
+  ssl->recv_state = SchannelRecvState::Ready;
+  return true;
+}
+
 bool ensure_decrypted_data(SSL* ssl) {
   if (!ssl || !ssl->ctxt_valid) return false;
+
+  if (ssl->decrypted_offset < ssl->decrypted.size()) return true;
+
+  if (ssl->recv_state == SchannelRecvState::Failed) {
+    if (ssl->last_error == SSL_ERROR_NONE) ssl->last_error = SSL_ERROR_SSL;
+    if (ssl->last_ret >= 0) ssl->last_ret = -1;
+    return false;
+  }
+
+  if (ssl->recv_state == SchannelRecvState::Renegotiating) {
+    if (!drive_receive_renegotiation(ssl)) return false;
+  }
+
+  if (ssl->recv_state == SchannelRecvState::CloseNotifySeen && ssl->incoming_encrypted.empty()) {
+    ssl->last_error = SSL_ERROR_ZERO_RETURN;
+    ssl->last_ret = 0;
+    return false;
+  }
 
   for (;;) {
     if (ssl->decrypted_offset < ssl->decrypted.size()) return true;
@@ -1589,31 +1717,35 @@ bool ensure_decrypted_data(SSL* ssl) {
       continue;
     }
 
-    if (st == SEC_I_CONTEXT_EXPIRED) {
-      ssl->shutdown_state |= SSL_RECEIVED_SHUTDOWN;
-      ssl->last_error = SSL_ERROR_ZERO_RETURN;
-      ssl->last_ret = 0;
-      return false;
-    }
-
-    if (st == SEC_I_RENEGOTIATE) {
-      ssl->last_error = SSL_ERROR_WANT_READ;
-      ssl->last_ret = -1;
-      return false;
-    }
-
-    if (st != SEC_E_OK) {
-      ssl->last_error = SSL_ERROR_SSL;
-      ssl->last_ret = -1;
-      set_error_message("DecryptMessage failed: " + std::to_string(static_cast<long>(st)));
-      return false;
-    }
-
     SecBuffer* data_buf = nullptr;
     SecBuffer* extra_buf = nullptr;
     for (auto& b : bufs) {
       if (b.BufferType == SECBUFFER_DATA) data_buf = &b;
       if (b.BufferType == SECBUFFER_EXTRA) extra_buf = &b;
+    }
+
+    bool is_renegotiate = (st == SEC_I_RENEGOTIATE);
+    bool context_expired = (st == SEC_I_CONTEXT_EXPIRED);
+
+    auto consume_extra = [&](bool keep_on_no_extra) {
+      size_t extra = extra_buf ? static_cast<size_t>(extra_buf->cbBuffer) : 0;
+      if (extra > 0) {
+        size_t used = ssl->incoming_encrypted.size() - extra;
+        std::memmove(ssl->incoming_encrypted.data(),
+                     ssl->incoming_encrypted.data() + used,
+                     extra);
+        ssl->incoming_encrypted.resize(extra);
+      } else if (!keep_on_no_extra) {
+        ssl->incoming_encrypted.clear();
+      }
+    };
+
+    if (st != SEC_E_OK && !is_renegotiate && !context_expired) {
+      ssl->recv_state = SchannelRecvState::Failed;
+      ssl->last_error = SSL_ERROR_SSL;
+      ssl->last_ret = -1;
+      set_error_message("DecryptMessage failed: " + std::to_string(static_cast<long>(st)));
+      return false;
     }
 
     if (data_buf && data_buf->pvBuffer && data_buf->cbBuffer > 0) {
@@ -1622,15 +1754,38 @@ bool ensure_decrypted_data(SSL* ssl) {
       ssl->decrypted_offset = 0;
     }
 
-    size_t extra = extra_buf ? static_cast<size_t>(extra_buf->cbBuffer) : 0;
-    if (extra > 0) {
-      size_t used = ssl->incoming_encrypted.size() - extra;
-      std::memmove(ssl->incoming_encrypted.data(),
-                   ssl->incoming_encrypted.data() + used,
-                   extra);
-      ssl->incoming_encrypted.resize(extra);
-    } else {
-      ssl->incoming_encrypted.clear();
+    consume_extra(is_renegotiate);
+
+    if (is_renegotiate) {
+      ssl->handshake_done = false;
+      ssl->handshake_needs_finish = false;
+      ssl->have_sizes = false;
+      ssl->recv_state = SchannelRecvState::Renegotiating;
+
+      if (!ssl->decrypted.empty()) {
+        ssl->last_error = SSL_ERROR_NONE;
+        ssl->last_ret = static_cast<int>(ssl->decrypted.size());
+        return true;
+      }
+
+      if (!drive_receive_renegotiation(ssl)) return false;
+      continue;
+    }
+
+    if (context_expired) {
+      ssl->shutdown_state |= SSL_RECEIVED_SHUTDOWN;
+      ssl->recv_state = SchannelRecvState::CloseNotifySeen;
+      if (ssl->decrypted.empty()) {
+        if (!ssl->incoming_encrypted.empty()) {
+          continue;
+        }
+        ssl->last_error = SSL_ERROR_ZERO_RETURN;
+        ssl->last_ret = 0;
+        return false;
+      }
+      ssl->last_error = SSL_ERROR_NONE;
+      ssl->last_ret = static_cast<int>(ssl->decrypted.size());
+      return true;
     }
 
     if (!ssl->decrypted.empty()) return true;

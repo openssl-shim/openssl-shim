@@ -838,6 +838,23 @@ OSStatus ssl_write_cb(SSLConnectionRef connection, const void* data, size_t* len
   return errSSLWouldBlock;
 }
 
+bool is_supported_tls_version(int version) {
+  switch (version) {
+    case 0:
+    case SSL3_VERSION:
+    case TLS1_VERSION:
+    case TLS1_1_VERSION:
+    case TLS1_2_VERSION:
+      return true;
+#ifdef kTLSProtocol13
+    case TLS1_3_VERSION:
+      return true;
+#endif
+    default:
+      return false;
+  }
+}
+
 SSLProtocol protocol_from_version(int version) {
   switch (version) {
     case TLS1_VERSION: return kTLSProtocol1;
@@ -2295,12 +2312,20 @@ void* SSL_CTX_get_default_passwd_cb_userdata(SSL_CTX* ctx) {
 
 int SSL_CTX_set_min_proto_version(SSL_CTX* ctx, int version) {
   if (!ctx) return 0;
+  if (!is_supported_tls_version(version)) {
+    set_error_message("SSL_CTX_set_min_proto_version: unsupported protocol version");
+    return 0;
+  }
   ctx->min_proto_version = version;
   return 1;
 }
 
 int SSL_CTX_set_max_proto_version(SSL_CTX* ctx, int version) {
   if (!ctx) return 0;
+  if (!is_supported_tls_version(version)) {
+    set_error_message("SSL_CTX_set_max_proto_version: unsupported protocol version");
+    return 0;
+  }
   ctx->max_proto_version = version;
   return 1;
 }
@@ -2458,7 +2483,9 @@ static int ssl_do_handshake(SSL* ssl) {
       return -1;
     }
 
-    if (st == errSSLServerAuthCompleted || st == errSSLClientAuthCompleted) {
+    if (st == errSSLPeerAuthCompleted || st == errSSLServerAuthCompleted ||
+        st == errSSLClientAuthCompleted) {
+      ssl->trust_evaluated = false;
       if (!post_handshake_verify(ssl, require_cert)) return -1;
       continue;
     }
@@ -2512,6 +2539,15 @@ int SSL_read(SSL* ssl, void* buf, int num) {
       ssl->last_error = ssl->io_want ? ssl->io_want : SSL_ERROR_WANT_READ;
       return -1;
     }
+    if (st == errSSLPeerAuthCompleted || st == errSSLServerAuthCompleted ||
+        st == errSSLClientAuthCompleted) {
+      auto effective_verify_mode = ssl->verify_mode ? ssl->verify_mode : ssl->ctx->verify_mode;
+      bool require_cert = !ssl->ctx->is_client &&
+                          (effective_verify_mode & SSL_VERIFY_FAIL_IF_NO_PEER_CERT);
+      ssl->trust_evaluated = false;
+      if (!post_handshake_verify(ssl, require_cert)) return -1;
+      continue;
+    }
     if (st == errSSLClosedGraceful || st == errSSLClosedAbort || st == errSSLClosedNoNotify) {
       ssl->shutdown_state |= SSL_RECEIVED_SHUTDOWN;
       ssl->last_ret = 0;
@@ -2547,6 +2583,15 @@ int SSL_write(SSL* ssl, const void* buf, int num) {
       ssl->last_error = ssl->io_want ? ssl->io_want : SSL_ERROR_WANT_WRITE;
       return -1;
     }
+    if (st == errSSLPeerAuthCompleted || st == errSSLServerAuthCompleted ||
+        st == errSSLClientAuthCompleted) {
+      auto effective_verify_mode = ssl->verify_mode ? ssl->verify_mode : ssl->ctx->verify_mode;
+      bool require_cert = !ssl->ctx->is_client &&
+                          (effective_verify_mode & SSL_VERIFY_FAIL_IF_NO_PEER_CERT);
+      ssl->trust_evaluated = false;
+      if (!post_handshake_verify(ssl, require_cert)) return -1;
+      continue;
+    }
     if (st == errSSLClosedGraceful || st == errSSLClosedAbort || st == errSSLClosedNoNotify) {
       ssl->shutdown_state |= SSL_RECEIVED_SHUTDOWN;
       ssl->last_ret = 0;
@@ -2581,6 +2626,14 @@ int SSL_peek(SSL* ssl, void* buf, int num) {
         ssl->last_ret = -1;
         ssl->last_error = ssl->io_want ? ssl->io_want : SSL_ERROR_WANT_READ;
         return -1;
+      } else if (st == errSSLPeerAuthCompleted || st == errSSLServerAuthCompleted ||
+                 st == errSSLClientAuthCompleted) {
+        auto effective_verify_mode = ssl->verify_mode ? ssl->verify_mode : ssl->ctx->verify_mode;
+        bool require_cert = !ssl->ctx->is_client &&
+                            (effective_verify_mode & SSL_VERIFY_FAIL_IF_NO_PEER_CERT);
+        ssl->trust_evaluated = false;
+        if (!post_handshake_verify(ssl, require_cert)) return -1;
+        continue;
       } else if (st == errSSLClosedGraceful || st == errSSLClosedAbort || st == errSSLClosedNoNotify) {
         ssl->shutdown_state |= SSL_RECEIVED_SHUTDOWN;
         ssl->last_ret = 0;
