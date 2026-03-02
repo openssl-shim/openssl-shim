@@ -138,6 +138,7 @@ int main(int argc, char** argv) {
   const char* pers = "mbedtls_tls13_server";
   int ret = 0;
   std::string req;
+  bool is_tls13_path = false;
 
   const std::string body = "ok";
   const std::string ok_resp =
@@ -229,7 +230,7 @@ int main(int argc, char** argv) {
     goto cleanup;
   }
 
-  const bool is_tls13_path = req.find("GET /tls13 ") == 0;
+  is_tls13_path = req.find("GET /tls13 ") == 0;
   ret = write_all(ssl, is_tls13_path ? ok_resp : not_found_resp);
   if (ret != 0) {
     print_mbedtls_error("write response", ret);
