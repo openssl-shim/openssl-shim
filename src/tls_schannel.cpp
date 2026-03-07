@@ -24,7 +24,6 @@
 #include <utility>
 #include <vector>
 
-#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -51,14 +50,6 @@
 #ifdef X509_EXTENSIONS
 #undef X509_EXTENSIONS
 #endif
-#else
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
-#endif
 
 using openssl_shim::clear_error_message;
 using openssl_shim::close_socket_fd;
@@ -71,7 +62,6 @@ using openssl_shim::set_fd_nonblocking;
 using openssl_shim::trim;
 using openssl_shim::wildcard_match;
 
-#ifdef _WIN32
 using socket_len_t = int;
 
 enum class SchannelRecvState {
@@ -80,16 +70,9 @@ enum class SchannelRecvState {
   CloseNotifySeen,
   Failed,
 };
-#else
-using socket_len_t = socklen_t;
-#endif
 
 struct x509_st {
-#ifdef _WIN32
   PCCERT_CONTEXT cert_ctx = nullptr;
-#else
-  void* cert_ctx = nullptr;
-#endif
   std::vector<unsigned char> der;
   std::string pem;
   int refs = 1;
@@ -100,9 +83,7 @@ struct x509_st {
   asn1_time_st not_after;
 
   ~x509_st() {
-#ifdef _WIN32
     if (cert_ctx) CertFreeCertificateContext(cert_ctx);
-#endif
   }
 };
 
@@ -110,27 +91,21 @@ struct x509_store_st {
   std::vector<X509*> certs;
   unsigned long flags = 0;
   stack_st_X509_OBJECT object_cache;
-#ifdef _WIN32
   HCERTSTORE store = nullptr;
-#endif
 
   x509_store_st() {
-#ifdef _WIN32
     store = CertOpenStore(CERT_STORE_PROV_MEMORY,
                           X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
                           0,
                           CERT_STORE_CREATE_NEW_FLAG,
                           nullptr);
-#endif
   }
 
   ~x509_store_st() {
     for (auto* cert : certs) {
       if (cert) X509_free(cert);
     }
-#ifdef _WIN32
     if (store) CertCloseStore(store, 0);
-#endif
   }
 };
 
@@ -146,7 +121,6 @@ struct bio_st {
 };
 
 struct evp_pkey_st {
-#ifdef _WIN32
   HCRYPTPROV hprov = 0;
   DWORD keyspec = AT_KEYEXCHANGE;
   NCRYPT_KEY_HANDLE nkey = 0;
@@ -154,13 +128,11 @@ struct evp_pkey_st {
   DWORD provider_type = PROV_RSA_AES;
   std::string provider_name = MS_ENH_RSA_AES_PROV_A;
   std::string container_name;
-#endif
   bool has_key = false;
   std::string pem;
   std::vector<unsigned char> pkcs8_der;
 
   ~evp_pkey_st() {
-#ifdef _WIN32
     if (use_ncrypt && nkey) {
       NCryptFreeObject(nkey);
       nkey = 0;
@@ -169,33 +141,23 @@ struct evp_pkey_st {
       CryptReleaseContext(hprov, 0);
       hprov = 0;
     }
-#endif
   }
 };
 
 struct evp_md_st {
-#ifdef _WIN32
   LPCWSTR algorithm = nullptr;
   ULONG digest_len = 0;
-#else
-  int algorithm = 0;
-  unsigned int digest_len = 0;
-#endif
 };
 
 struct evp_md_ctx_st {
-#ifdef _WIN32
   BCRYPT_ALG_HANDLE alg = nullptr;
   BCRYPT_HASH_HANDLE hash = nullptr;
   std::vector<unsigned char> hash_object;
-#endif
   const EVP_MD* current = nullptr;
 
   ~evp_md_ctx_st() {
-#ifdef _WIN32
     if (hash) BCryptDestroyHash(hash);
     if (alg) BCryptCloseAlgorithmProvider(alg, 0);
-#endif
   }
 };
 
@@ -220,10 +182,8 @@ struct ssl_ctx_st {
   X509* own_cert = nullptr;
   EVP_PKEY* own_key = nullptr;
   std::vector<X509*> own_chain;
-#ifdef _WIN32
   HCERTSTORE user_intermediate_store = nullptr;
   std::vector<PCCERT_CONTEXT> installed_chain_certs;
-#endif
 
   std::vector<std::string> alpn_protocols;
   std::vector<unsigned char> alpn_wire;
@@ -238,7 +198,6 @@ struct ssl_ctx_st {
     for (auto* cert : own_chain) {
       if (cert) X509_free(cert);
     }
-#ifdef _WIN32
     for (auto* cert_ctx : installed_chain_certs) {
       if (cert_ctx) CertDeleteCertificateFromStore(cert_ctx);
     }
@@ -247,7 +206,6 @@ struct ssl_ctx_st {
       CertCloseStore(user_intermediate_store, 0);
       user_intermediate_store = nullptr;
     }
-#endif
   }
 };
 
@@ -276,7 +234,6 @@ struct ssl_st {
 
   long verify_result = X509_V_OK;
 
-#ifdef _WIN32
   CredHandle cred{};
   bool cred_valid = false;
   CtxtHandle ctxt{};
@@ -301,29 +258,22 @@ struct ssl_st {
   bool shutdown_sent = false;
   bool handshake_needs_finish = false;
   SchannelRecvState recv_state = SchannelRecvState::Ready;
-#endif
 
   X509* peer_cert = nullptr;
 
   ~ssl_st() {
     auto wipe_bytes = [](std::vector<unsigned char>& bytes) {
       if (!bytes.empty()) {
-#ifdef _WIN32
         SecureZeroMemory(bytes.data(), bytes.size());
-#else
-        std::fill(bytes.begin(), bytes.end(), 0);
-#endif
       }
       bytes.clear();
       bytes.shrink_to_fit();
     };
 
     wipe_bytes(peeked_plaintext);
-#ifdef _WIN32
     wipe_bytes(incoming_encrypted);
     wipe_bytes(decrypted);
     wipe_bytes(pending_send);
-#endif
 
     if (peer_cert) X509_free(peer_cert);
     if (rbio) {
@@ -336,7 +286,6 @@ struct ssl_st {
       rbio = nullptr;
       wbio = nullptr;
     }
-#ifdef _WIN32
     if (ctxt_valid) {
       DeleteSecurityContext(&ctxt);
       ctxt_valid = false;
@@ -353,23 +302,15 @@ struct ssl_st {
       CertCloseStore(server_cred_store, 0);
       server_cred_store = nullptr;
     }
-#endif
   }
 };
 
 const bio_method_st g_mem_method{1};
 
-#ifdef _WIN32
 const EVP_MD g_md5{BCRYPT_MD5_ALGORITHM, 16};
 const EVP_MD g_sha256{BCRYPT_SHA256_ALGORITHM, 32};
 const EVP_MD g_sha512{BCRYPT_SHA512_ALGORITHM, 64};
-#else
-const EVP_MD g_md5{};
-const EVP_MD g_sha256{};
-const EVP_MD g_sha512{};
-#endif
 
-#ifdef _WIN32
 std::string wide_to_utf8(const std::wstring& ws) {
   if (ws.empty()) return {};
   int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, nullptr, 0, nullptr, nullptr);
@@ -1982,10 +1923,6 @@ bool cert_matches_hostname(const X509* cert, const std::string& host, bool check
   return false;
 }
 
-#else
-// Non-Windows build placeholder helpers.
-#endif
-
 void ssl_set_connect_state_impl(SSL* ssl) {
   if (!ssl || !ssl->ctx) return;
   ssl->ctx->is_client = true;
@@ -2048,11 +1985,7 @@ int BIO_read(BIO* bio, void* data, int len) {
   }
 
   if (bio->kind == BioKind::Socket && bio->fd >= 0) {
-#ifdef _WIN32
     return recv(bio->fd, static_cast<char*>(data), len, 0);
-#else
-    return static_cast<int>(recv(bio->fd, data, static_cast<size_t>(len), 0));
-#endif
   }
 
   return -1;
@@ -2079,11 +2012,7 @@ int BIO_write(BIO* bio, const void* data, int len) {
   }
 
   if (bio->kind == BioKind::Socket && bio->fd >= 0) {
-#ifdef _WIN32
     return send(bio->fd, static_cast<const char*>(data), len, 0);
-#else
-    return static_cast<int>(send(bio->fd, data, static_cast<size_t>(len), 0));
-#endif
   }
 
   return -1;
@@ -2108,7 +2037,6 @@ int BIO_free(BIO* a) {
 
 /* ===== EVP ===== */
 int EVP_DigestInit_ex(EVP_MD_CTX* ctx, const EVP_MD* type, void* /*engine*/) {
-#ifdef _WIN32
   if (!ctx || !type || !type->algorithm) return 0;
 
   if (ctx->hash) {
@@ -2146,48 +2074,28 @@ int EVP_DigestInit_ex(EVP_MD_CTX* ctx, const EVP_MD* type, void* /*engine*/) {
 
   ctx->current = type;
   return 1;
-#else
-  (void)ctx;
-  (void)type;
-  return 0;
-#endif
 }
 
 int EVP_DigestUpdate(EVP_MD_CTX* ctx, const void* d, size_t cnt) {
-#ifdef _WIN32
   if (!ctx || !ctx->hash || (!d && cnt > 0)) return 0;
   NTSTATUS st = BCryptHashData(ctx->hash,
                                const_cast<PUCHAR>(static_cast<const unsigned char*>(d)),
                                static_cast<ULONG>(cnt),
                                0);
   return st == 0 ? 1 : 0;
-#else
-  (void)ctx;
-  (void)d;
-  (void)cnt;
-  return 0;
-#endif
 }
 
 int EVP_DigestFinal_ex(EVP_MD_CTX* ctx, unsigned char* md, unsigned int* s) {
-#ifdef _WIN32
   if (!ctx || !ctx->hash || !ctx->current || !md) return 0;
   NTSTATUS st = BCryptFinishHash(ctx->hash, md, ctx->current->digest_len, 0);
   if (st != 0) return 0;
   if (s) *s = ctx->current->digest_len;
   return 1;
-#else
-  (void)ctx;
-  (void)md;
-  if (s) *s = 0;
-  return 0;
-#endif
 }
 
 void EVP_PKEY_free(EVP_PKEY* pkey) { delete pkey; }
 
 EVP_PKEY* d2i_PrivateKey_bio(BIO* bp, EVP_PKEY** a) {
-#ifdef _WIN32
   if (!bp) return nullptr;
   char* p = nullptr;
   long n = BIO_get_mem_data(bp, &p);
@@ -2205,23 +2113,12 @@ EVP_PKEY* d2i_PrivateKey_bio(BIO* bp, EVP_PKEY** a) {
   pkey->has_key = true;
   if (a) *a = pkey;
   return pkey;
-#else
-  (void)bp;
-  (void)a;
-  return nullptr;
-#endif
 }
 
 int EVP_PKEY_is_a(const EVP_PKEY* pkey, const char* name) {
-#ifdef _WIN32
   if (!pkey || !pkey->has_key || !name) return 0;
   if (std::strcmp(name, "RSA") != 0) return 0;
   return 1;
-#else
-  (void)pkey;
-  (void)name;
-  return 0;
-#endif
 }
 
 /* ===== X509 ===== */
@@ -2236,7 +2133,6 @@ int i2d_X509(const X509* x, unsigned char** out) {
 
 /* ===== X509 store ===== */
 void* X509_get_ext_d2i(X509* x, int nid, int* /*crit*/, int* /*idx*/) {
-#ifdef _WIN32
   if (!x || !x->cert_ctx || nid != NID_subject_alt_name) return nullptr;
   if (!x->cert_ctx->pCertInfo) return nullptr;
 
@@ -2327,16 +2223,10 @@ void* X509_get_ext_d2i(X509* x, int nid, int* /*crit*/, int* /*idx*/) {
   }
 
   return out;
-#else
-  (void)x;
-  (void)nid;
-  return nullptr;
-#endif
 }
 
 /* ===== PEM ===== */
 X509* PEM_read_bio_X509(BIO* bp, X509** x, pem_password_cb* /*cb*/, void* /*u*/) {
-#ifdef _WIN32
   if (!bp) return nullptr;
 
   std::string pem;
@@ -2354,15 +2244,9 @@ X509* PEM_read_bio_X509(BIO* bp, X509** x, pem_password_cb* /*cb*/, void* /*u*/)
   cert->pem = pem;
   if (x) *x = cert;
   return cert;
-#else
-  (void)bp;
-  (void)x;
-  return nullptr;
-#endif
 }
 
 EVP_PKEY* PEM_read_bio_PrivateKey(BIO* bp, EVP_PKEY** x, pem_password_cb* /*cb*/, void* /*u*/) {
-#ifdef _WIN32
   if (!bp) return nullptr;
 
   std::string pem;
@@ -2411,15 +2295,9 @@ EVP_PKEY* PEM_read_bio_PrivateKey(BIO* bp, EVP_PKEY** x, pem_password_cb* /*cb*/
 
   if (x) *x = pkey;
   return pkey;
-#else
-  (void)bp;
-  (void)x;
-  return nullptr;
-#endif
 }
 
 int PEM_write_bio_X509(BIO* bp, X509* x) {
-#ifdef _WIN32
   if (!bp || !x || bp->kind != BioKind::Memory || x->der.empty()) return 0;
 
   std::string pem = x->pem;
@@ -2431,16 +2309,10 @@ int PEM_write_bio_X509(BIO* bp, X509* x) {
   bp->data.insert(bp->data.end(), pem.begin(), pem.end());
   if (!pem.empty() && pem.back() != '\n') bp->data.push_back('\n');
   return 1;
-#else
-  (void)bp;
-  (void)x;
-  return 0;
-#endif
 }
 
 int PEM_write_bio_PrivateKey(BIO* bp, EVP_PKEY* x, const void* /*enc*/, unsigned char* /*kstr*/,
                              int /*klen*/, pem_password_cb* /*cb*/, void* /*u*/) {
-#ifdef _WIN32
   if (!bp || !x || bp->kind != BioKind::Memory || !x->has_key) return 0;
 
   std::string pem = x->pem;
@@ -2454,11 +2326,6 @@ int PEM_write_bio_PrivateKey(BIO* bp, EVP_PKEY* x, const void* /*enc*/, unsigned
   bp->data.insert(bp->data.end(), pem.begin(), pem.end());
   if (!pem.empty() && pem.back() != '\n') bp->data.push_back('\n');
   return 1;
-#else
-  (void)bp;
-  (void)x;
-  return 0;
-#endif
 }
 
 /* ===== SSL methods/context ===== */
@@ -2556,7 +2423,6 @@ int SSL_CTX_set_cipher_list(SSL_CTX* ctx, const char* str) {
 }
 
 int SSL_CTX_load_verify_locations(SSL_CTX* ctx, const char* ca_file, const char* ca_path) {
-#ifdef _WIN32
   if (!ctx || !ctx->cert_store) return 0;
 
   bool loaded = false;
@@ -2567,12 +2433,6 @@ int SSL_CTX_load_verify_locations(SSL_CTX* ctx, const char* ca_file, const char*
     loaded = load_ca_path_into_store(ctx->cert_store, ca_path) || loaded;
   }
   return loaded ? 1 : 0;
-#else
-  (void)ctx;
-  (void)ca_file;
-  (void)ca_path;
-  return 0;
-#endif
 }
 
 int SSL_CTX_set_default_verify_paths(SSL_CTX* ctx) {
@@ -2604,7 +2464,6 @@ int SSL_CTX_use_certificate_file(SSL_CTX* ctx, const char* file, int /*type*/) {
   ctx->own_cert = cert;
   clear_ctx_own_chain(ctx);
 
-#ifdef _WIN32
   if (ctx->own_cert && ctx->own_key) {
     if (!attach_private_key_to_cert(ctx->own_cert, ctx->own_key)) {
       if (ERR_peek_last_error() == 0) {
@@ -2613,7 +2472,6 @@ int SSL_CTX_use_certificate_file(SSL_CTX* ctx, const char* file, int /*type*/) {
       return 0;
     }
   }
-#endif
 
   return 1;
 }
@@ -2652,7 +2510,6 @@ int SSL_CTX_use_certificate_chain_file(SSL_CTX* ctx, const char* file) {
     ctx->own_chain.push_back(certs[i]);
   }
 
-#ifdef _WIN32
   if (!sync_ctx_chain_to_user_intermediate_store(ctx)) {
     return 0;
   }
@@ -2665,7 +2522,6 @@ int SSL_CTX_use_certificate_chain_file(SSL_CTX* ctx, const char* file) {
       return 0;
     }
   }
-#endif
 
   return 1;
 }
@@ -2706,7 +2562,6 @@ int SSL_CTX_use_PrivateKey_file(SSL_CTX* ctx, const char* file, int /*type*/) {
   if (ctx->own_key) EVP_PKEY_free(ctx->own_key);
   ctx->own_key = pkey;
 
-#ifdef _WIN32
   if (ctx->own_cert && ctx->own_key) {
     if (!attach_private_key_to_cert(ctx->own_cert, ctx->own_key)) {
       if (ERR_peek_last_error() == 0) {
@@ -2715,7 +2570,6 @@ int SSL_CTX_use_PrivateKey_file(SSL_CTX* ctx, const char* file, int /*type*/) {
       return 0;
     }
   }
-#endif
 
   return 1;
 }
@@ -2726,16 +2580,13 @@ int SSL_CTX_use_certificate(SSL_CTX* ctx, X509* x) {
   X509_up_ref(x);
   ctx->own_cert = x;
   clear_ctx_own_chain(ctx);
-#ifdef _WIN32
   if (ctx->own_cert && ctx->own_key) {
     if (!attach_private_key_to_cert(ctx->own_cert, ctx->own_key)) return 0;
   }
-#endif
   return 1;
 }
 
 int SSL_CTX_use_certificate_ASN1(SSL_CTX* ctx, int len, const unsigned char* d) {
-#ifdef _WIN32
   if (!ctx || !d || len <= 0) return 0;
 
   auto* cert = x509_from_der(d, static_cast<size_t>(len));
@@ -2755,19 +2606,12 @@ int SSL_CTX_use_certificate_ASN1(SSL_CTX* ctx, int len, const unsigned char* d) 
   }
 
   return 1;
-#else
-  (void)ctx;
-  (void)len;
-  (void)d;
-  return 0;
-#endif
 }
 
 int SSL_CTX_use_PrivateKey(SSL_CTX* ctx, EVP_PKEY* pkey) {
   if (!ctx || !pkey || !pkey->has_key) return 0;
   if (ctx->own_key) EVP_PKEY_free(ctx->own_key);
   auto* dup = new EVP_PKEY();
-#ifdef _WIN32
   if (!pkey->pkcs8_der.empty()) {
     if (!import_private_key_pkcs8(pkey->pkcs8_der, dup)) {
       delete dup;
@@ -2777,23 +2621,19 @@ int SSL_CTX_use_PrivateKey(SSL_CTX* ctx, EVP_PKEY* pkey) {
     delete dup;
     return 0;
   }
-#endif
   dup->has_key = pkey->has_key;
   dup->pem = pkey->pem;
   dup->pkcs8_der = pkey->pkcs8_der;
   ctx->own_key = dup;
 
-#ifdef _WIN32
   if (ctx->own_cert && ctx->own_key) {
     if (!attach_private_key_to_cert(ctx->own_cert, ctx->own_key)) return 0;
   }
-#endif
 
   return 1;
 }
 
 int SSL_CTX_check_private_key(const SSL_CTX* ctx) {
-#ifdef _WIN32
   if (!ctx || !ctx->own_cert || !ctx->own_key) return 0;
   if (!ctx->own_cert->cert_ctx) return 0;
 
@@ -2825,10 +2665,6 @@ int SSL_CTX_check_private_key(const SSL_CTX* ctx) {
                                      &ctx->own_cert->cert_ctx->pCertInfo->SubjectPublicKeyInfo,
                                      info);
   return ok ? 1 : 0;
-#else
-  (void)ctx;
-  return 0;
-#endif
 }
 
 int SSL_CTX_add_extra_chain_cert(SSL_CTX* ctx, X509* x509) {
@@ -2841,11 +2677,9 @@ int SSL_CTX_add_extra_chain_cert(SSL_CTX* ctx, X509* x509) {
     ctx->own_chain.push_back(x509);
   }
 
-#ifdef _WIN32
   if (!sync_ctx_chain_to_user_intermediate_store(ctx)) {
     return 0;
   }
-#endif
 
   return 1;
 }
@@ -2977,7 +2811,6 @@ SSL_CTX* SSL_get_SSL_CTX(const SSL* ssl) {
 }
 
 int SSL_connect(SSL* ssl) {
-#ifdef _WIN32
   if (!ssl || !ssl->ctx || !ssl->ctx->is_client) return -1;
   if (!has_ssl_transport(ssl)) {
     ssl->last_error = SSL_ERROR_SYSCALL;
@@ -3008,14 +2841,9 @@ int SSL_connect(SSL* ssl) {
     return -1;
   }
   return -1;
-#else
-  (void)ssl;
-  return -1;
-#endif
 }
 
 int SSL_accept(SSL* ssl) {
-#ifdef _WIN32
   if (!ssl || !ssl->ctx || ssl->ctx->is_client) return -1;
   if (!has_ssl_transport(ssl)) {
     ssl->last_error = SSL_ERROR_SYSCALL;
@@ -3042,14 +2870,9 @@ int SSL_accept(SSL* ssl) {
     return -1;
   }
   return -1;
-#else
-  (void)ssl;
-  return -1;
-#endif
 }
 
 int SSL_read(SSL* ssl, void* buf, int num) {
-#ifdef _WIN32
   if (!ssl || !buf || num <= 0) return -1;
 
   if (!ssl->handshake_done) {
@@ -3083,16 +2906,9 @@ int SSL_read(SSL* ssl, void* buf, int num) {
   ssl->last_ret = n;
   ssl->last_error = SSL_ERROR_NONE;
   return n;
-#else
-  (void)ssl;
-  (void)buf;
-  (void)num;
-  return -1;
-#endif
 }
 
 int SSL_write(SSL* ssl, const void* buf, int num) {
-#ifdef _WIN32
   if (!ssl || !buf || num <= 0) return -1;
 
   if (!ssl->handshake_done) {
@@ -3164,12 +2980,6 @@ int SSL_write(SSL* ssl, const void* buf, int num) {
   ssl->last_ret = done;
   ssl->last_error = SSL_ERROR_NONE;
   return done;
-#else
-  (void)ssl;
-  (void)buf;
-  (void)num;
-  return -1;
-#endif
 }
 
 int SSL_peek(SSL* ssl, void* buf, int num) {
@@ -3191,16 +3001,11 @@ int SSL_peek(SSL* ssl, void* buf, int num) {
 
 int SSL_pending(const SSL* ssl) {
   if (!ssl) return 0;
-#ifdef _WIN32
   return static_cast<int>(ssl->peeked_plaintext.size()) +
          static_cast<int>(ssl->decrypted.size() - ssl->decrypted_offset);
-#else
-  return static_cast<int>(ssl->peeked_plaintext.size());
-#endif
 }
 
 int SSL_shutdown(SSL* ssl) {
-#ifdef _WIN32
   if (!ssl) return 0;
 
   if (!ssl->shutdown_sent) {
@@ -3230,10 +3035,6 @@ int SSL_shutdown(SSL* ssl) {
   ssl->last_ret = 0;
   ssl->last_error = SSL_ERROR_WANT_READ;
   return 0;
-#else
-  (void)ssl;
-  return 1;
-#endif
 }
 
 int SSL_get_shutdown(const SSL* ssl) {
