@@ -33,7 +33,9 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <winternl.h>
 #define SECURITY_WIN32
+#define SCHANNEL_USE_BLACKLISTS
 #include <security.h>
 #include <schannel.h>
 #include <wincrypt.h>
@@ -996,6 +998,102 @@ DWORD tls_protocol_flags(const SSL_CTX* ctx, bool client) {
   return p;
 }
 
+bool is_tls13_only_protocol_flags(DWORD enabled, bool client) {
+  DWORD tls13 = 0;
+  if (client) {
+#ifdef SP_PROT_TLS1_3_CLIENT
+    tls13 = SP_PROT_TLS1_3_CLIENT;
+#endif
+  } else {
+#ifdef SP_PROT_TLS1_3_SERVER
+    tls13 = SP_PROT_TLS1_3_SERVER;
+#endif
+  }
+  return tls13 != 0 && enabled == tls13;
+}
+
+int schannel_protocol_to_tls_version(DWORD protocol) {
+  switch (protocol) {
+#ifdef SP_PROT_TLS1_CLIENT
+    case SP_PROT_TLS1_CLIENT:
+#endif
+#ifdef SP_PROT_TLS1_SERVER
+    case SP_PROT_TLS1_SERVER:
+#endif
+#ifdef SP_PROT_TLS1
+    case SP_PROT_TLS1:
+#endif
+      return TLS1_VERSION;
+#ifdef SP_PROT_TLS1_1_CLIENT
+    case SP_PROT_TLS1_1_CLIENT:
+#endif
+#ifdef SP_PROT_TLS1_1_SERVER
+    case SP_PROT_TLS1_1_SERVER:
+#endif
+#ifdef SP_PROT_TLS1_1
+    case SP_PROT_TLS1_1:
+#endif
+      return TLS1_1_VERSION;
+#ifdef SP_PROT_TLS1_2_CLIENT
+    case SP_PROT_TLS1_2_CLIENT:
+#endif
+#ifdef SP_PROT_TLS1_2_SERVER
+    case SP_PROT_TLS1_2_SERVER:
+#endif
+#ifdef SP_PROT_TLS1_2
+    case SP_PROT_TLS1_2:
+#endif
+      return TLS1_2_VERSION;
+#ifdef SP_PROT_TLS1_3_CLIENT
+    case SP_PROT_TLS1_3_CLIENT:
+#endif
+#ifdef SP_PROT_TLS1_3_SERVER
+    case SP_PROT_TLS1_3_SERVER:
+#endif
+#ifdef SP_PROT_TLS1_3
+    case SP_PROT_TLS1_3:
+#endif
+      return TLS1_3_VERSION;
+    default:
+      return 0;
+  }
+}
+
+bool validate_negotiated_protocol(SSL* ssl) {
+  if (!ssl || !ssl->ctx || !ssl->ctxt_valid) return false;
+
+  SecPkgContext_ConnectionInfo info{};
+  SECURITY_STATUS st = QueryContextAttributes(&ssl->ctxt, SECPKG_ATTR_CONNECTION_INFO, &info);
+  if (st != SEC_E_OK) {
+    set_error_message("QueryContextAttributes(SECPKG_ATTR_CONNECTION_INFO) failed");
+    ssl->last_error = SSL_ERROR_SSL;
+    ssl->last_ret = -1;
+    return false;
+  }
+
+  int negotiated = schannel_protocol_to_tls_version(info.dwProtocol);
+  if (negotiated == 0) {
+    set_error_message("unsupported negotiated TLS protocol");
+    ssl->last_error = SSL_ERROR_SSL;
+    ssl->last_ret = -1;
+    return false;
+  }
+
+  int minv = ssl->ctx->min_proto_version;
+  int maxv = ssl->ctx->max_proto_version;
+  if (maxv == 0) maxv = TLS1_3_VERSION;
+  if (minv > maxv) std::swap(minv, maxv);
+
+  if (negotiated < minv || negotiated > maxv) {
+    set_error_message("negotiated TLS protocol outside configured range");
+    ssl->last_error = SSL_ERROR_SSL;
+    ssl->last_ret = -1;
+    return false;
+  }
+
+  return true;
+}
+
 void clear_ssl_server_cred_chain_cache(SSL* ssl) {
   if (!ssl) return;
   if (ssl->server_cred_cert) {
@@ -1069,13 +1167,11 @@ bool ensure_credentials(SSL* ssl) {
   if (!ssl || !ssl->ctx) return false;
   if (ssl->cred_valid) return true;
 
-  SCHANNEL_CRED cred{};
-  cred.dwVersion = SCHANNEL_CRED_VERSION;
-  cred.dwFlags = SCH_USE_STRONG_CRYPTO;
+  DWORD enabled_protocols = tls_protocol_flags(ssl->ctx, ssl->ctx->is_client);
+  DWORD cred_flags = SCH_USE_STRONG_CRYPTO;
   if (ssl->ctx->is_client) {
-    cred.dwFlags |= SCH_CRED_MANUAL_CRED_VALIDATION | SCH_CRED_NO_DEFAULT_CREDS;
+    cred_flags |= SCH_CRED_MANUAL_CRED_VALIDATION | SCH_CRED_NO_DEFAULT_CREDS;
   }
-  cred.grbitEnabledProtocols = tls_protocol_flags(ssl->ctx, ssl->ctx->is_client);
 
   PCCERT_CONTEXT cert_ctx = nullptr;
   if (ssl->ctx->is_client) {
@@ -1101,10 +1197,6 @@ bool ensure_credentials(SSL* ssl) {
     }
   }
 
-  if (!ssl->ctx->is_client && ssl->server_cred_store) {
-    cred.hRootStore = ssl->server_cred_store;
-  }
-
   if (cert_ctx) {
     HCRYPTPROV_OR_NCRYPT_KEY_HANDLE key = 0;
     DWORD key_spec = 0;
@@ -1125,23 +1217,67 @@ bool ensure_credentials(SSL* ssl) {
       if (key_spec == CERT_NCRYPT_KEY_SPEC) NCryptFreeObject(key);
       else CryptReleaseContext(key, 0);
     }
-
-    cred.cCreds = 1;
-    cred.paCred = &cert_ctx;
   }
 
+  SECURITY_STATUS st = SEC_E_OK;
   TimeStamp ts{};
-  SECURITY_STATUS st = AcquireCredentialsHandleA(nullptr,
-                                                 const_cast<char*>(UNISP_NAME_A),
-                                                 ssl->ctx->is_client ? SECPKG_CRED_OUTBOUND : SECPKG_CRED_INBOUND,
-                                                 nullptr,
-                                                 &cred,
-                                                 nullptr,
-                                                 nullptr,
-                                                 &ssl->cred,
-                                                 &ts);
+
+  if (ssl->ctx->is_client && is_tls13_only_protocol_flags(enabled_protocols, true)) {
+#ifdef SCH_SEND_AUX_RECORD
+    cred_flags |= SCH_SEND_AUX_RECORD;
+#endif
+    TLS_PARAMETERS tls_params{};
+    tls_params.grbitDisabledProtocols = ~enabled_protocols;
+
+    SCH_CREDENTIALS cred{};
+    cred.dwVersion = SCH_CREDENTIALS_VERSION;
+    cred.dwFlags = cred_flags;
+    cred.cTlsParameters = 1;
+    cred.pTlsParameters = &tls_params;
+    if (cert_ctx) {
+      cred.cCreds = 1;
+      cred.paCred = &cert_ctx;
+    }
+
+    st = AcquireCredentialsHandleW(nullptr,
+                                   const_cast<wchar_t*>(UNISP_NAME_W),
+                                   SECPKG_CRED_OUTBOUND,
+                                   nullptr,
+                                   &cred,
+                                   nullptr,
+                                   nullptr,
+                                   &ssl->cred,
+                                   &ts);
+  } else {
+    SCHANNEL_CRED cred{};
+    cred.dwVersion = SCHANNEL_CRED_VERSION;
+    cred.dwFlags = cred_flags;
+    cred.grbitEnabledProtocols = enabled_protocols;
+
+    if (!ssl->ctx->is_client && ssl->server_cred_store) {
+      cred.hRootStore = ssl->server_cred_store;
+    }
+
+    if (cert_ctx) {
+      cred.cCreds = 1;
+      cred.paCred = &cert_ctx;
+    }
+
+    st = AcquireCredentialsHandleA(nullptr,
+                                   const_cast<char*>(UNISP_NAME_A),
+                                   ssl->ctx->is_client ? SECPKG_CRED_OUTBOUND
+                                                       : SECPKG_CRED_INBOUND,
+                                   nullptr,
+                                   &cred,
+                                   nullptr,
+                                   nullptr,
+                                   &ssl->cred,
+                                   &ts);
+  }
+
   if (st != SEC_E_OK) {
-    set_error_message("AcquireCredentialsHandle failed: " + std::to_string(static_cast<long>(st)));
+    set_error_message("AcquireCredentialsHandle failed: " +
+                      std::to_string(static_cast<long>(st)));
     ssl->last_error = SSL_ERROR_SSL;
     ssl->last_ret = -1;
     return false;
@@ -1400,6 +1536,7 @@ bool schannel_handshake(SSL* ssl) {
     if (!flush_pending_send(ssl)) return false;
     if (!query_stream_sizes(ssl)) return false;
     query_selected_alpn(ssl);
+    if (!validate_negotiated_protocol(ssl)) return false;
     if (!post_handshake_verify(ssl)) return false;
     ssl->handshake_done = true;
     ssl->handshake_needs_finish = false;
@@ -1460,11 +1597,16 @@ bool schannel_handshake(SSL* ssl) {
                     ISC_REQ_REPLAY_DETECT |
                     ISC_REQ_SEQUENCE_DETECT |
                     ISC_REQ_STREAM;
-      st = InitializeSecurityContextA(
+      std::wstring target_name;
+      wchar_t* target_ptr = nullptr;
+      if (!ssl->handshake_started && !ssl->hostname.empty()) {
+        target_name = utf8_to_wide(ssl->hostname);
+        target_ptr = target_name.empty() ? nullptr : const_cast<wchar_t*>(target_name.c_str());
+      }
+      st = InitializeSecurityContextW(
           &ssl->cred,
           ssl->handshake_started ? &ssl->ctxt : nullptr,
-          ssl->handshake_started ? nullptr
-                                 : const_cast<char*>(ssl->hostname.empty() ? nullptr : ssl->hostname.c_str()),
+          target_ptr,
           flags,
           0,
           0,
@@ -1539,6 +1681,7 @@ bool schannel_handshake(SSL* ssl) {
       }
       if (!query_stream_sizes(ssl)) return false;
       query_selected_alpn(ssl);
+      if (!validate_negotiated_protocol(ssl)) return false;
       if (!post_handshake_verify(ssl)) return false;
       ssl->handshake_done = true;
       ssl->handshake_needs_finish = false;

@@ -359,8 +359,7 @@ if(TARGET asio_standalone)
     set_tests_properties(test_uwebsockets_https_roundtrip PROPERTIES TIMEOUT 60)
   endif()
 endif()
-if(NOT OPENSSL_SHIM_EFFECTIVE_BACKEND STREQUAL "SCHANNEL" AND
-   TARGET test_mbedtls_tls13_server)
+if(TARGET test_mbedtls_tls13_server)
   add_test(NAME test_tls13_only
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/run_tls13_only_test.py
       --source-dir ${CMAKE_SOURCE_DIR}
